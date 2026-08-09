@@ -1,6 +1,7 @@
 #include "sort.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <concepts>
@@ -57,6 +58,17 @@ auto div_ceil(const auto left, const auto right) {
   DebugAssert(right > 0, "Divisor must be larger than 0.");
   return (left + right - 1) / right;
 }
+
+// Run generation: radix sort vs. pdqsort.
+constexpr bool USE_RADIX_SORT = true;
+
+// A pairwise/k-way merge is split into ceil(total / MERGE_PATH_PARTITION_SIZE) independent tasks so that even the
+// final merges use every core. A value >= total yields a single (serial) merge.
+constexpr size_t MERGE_PATH_PARTITION_SIZE = size_t{1} << 16;
+
+// Radix sort tuning constants.
+constexpr size_t RADIX_BUCKET_SIZE = 256;
+constexpr size_t RADIX_INSERTION_SORT_THRESHOLD = 24;
 
 // Given an unsorted_table and a pos_list that defines the output order, this materializes all columns in the table,
 // creating chunks of output_chunk_size rows at maximum.
@@ -265,9 +277,24 @@ int static_memcmp(std::byte* left, std::byte* right, size_t len) {
   }
 }
 
+// Load the first min(8, key_size) key bytes into a uint64 with byte 0 in the most-significant position (and zero
+// padding for short keys), so that a plain unsigned compare of two prefixes equals memcmp of those bytes.
+inline uint64_t load_key_prefix(const std::byte* key, size_t key_size) {
+  uint64_t prefix = 0;
+  const size_t byte_count = std::min<size_t>(8, key_size);
+  // key 0 is the MSD
+  for (size_t index = 0; index < byte_count; ++index) {
+    // Byte shift
+    prefix |= static_cast<uint64_t>(std::to_integer<uint8_t>(key[index])) << (56 - 8 * index);
+  }
+  return prefix;
+}
+
 struct NormalizedKeyRow {
   constexpr NormalizedKeyRow(std::byte* key_head, RowID row_id) noexcept : key_head(key_head), row_id(row_id) {}
 
+  // First 8 key bytes, resolved from the cache-resident row array;
+  uint64_t prefix = 0;
   std::byte* key_head = nullptr;
   RowID row_id;
 
@@ -275,11 +302,351 @@ struct NormalizedKeyRow {
     if (expected_size == 0) {
       return false;
     }
+    if (prefix != other.prefix) {
+      return prefix < other.prefix;
+    }
+    // Prefix tie: If the key is no longer than the prefix, they are equal. Don't change order.
+    if (expected_size <= sizeof(uint64_t)) {
+      return false;
+    }
     DebugAssert(key_head, "NormalizedKey is not valid.");
     DebugAssert(other.key_head, "NormalizedKey is not valid.");
-    return static_memcmp<1, 32>(key_head, other.key_head, expected_size) < 0;
+    return static_memcmp<1, 32>(key_head + sizeof(uint64_t), other.key_head + sizeof(uint64_t),
+                                expected_size - sizeof(uint64_t)) < 0;
   }
 };
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Radix sort (run generation). Drop-in replacement for the per-run pdqsort. LSD for keys <= 4 bytes, MSD otherwise,
+// with an insertion-sort base case and a single-bucket skip. Operates only on the first `key_size`
+// (= normalized_key_size) bytes, never the padded tail, so the uninitialized padding is never read. The radix sort is
+// stable (counting-sort scatter in input order + strict-less insertion sort), so combined with the run-order tie-break
+// in the merge, the whole pipeline is a stable sort when USE_RADIX_SORT is on.
+// ---------------------------------------------------------------------------------------------------------------------
+
+inline size_t radix_byte_at(const NormalizedKeyRow& row, size_t byte_index) {
+  return static_cast<size_t>(std::to_integer<uint8_t>(row.key_head[byte_index]));
+}
+
+inline void insertion_sort_run(NormalizedKeyRow* begin, NormalizedKeyRow* end, size_t key_size) {
+  for (auto* i = begin + 1; i < end; ++i) {
+    const auto value = *i;
+    auto* j = i;
+    while (j > begin && value.less_than(*(j - 1), key_size)) {
+      *j = *(j - 1);
+      --j;
+    }
+    *j = value;
+  }
+}
+
+void msd_radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res, size_t byte_index,
+                    size_t key_size) {
+  const auto row_count = static_cast<size_t>(end - begin);
+  if (row_count <= 1) {
+    return;
+  }
+  if (row_count <= RADIX_INSERTION_SORT_THRESHOLD || byte_index >= key_size) {
+    insertion_sort_run(begin, end, key_size);
+    return;
+  }
+
+  auto count = std::array<size_t, RADIX_BUCKET_SIZE>{};
+  for (auto* it = begin; it != end; ++it) {
+    ++count[radix_byte_at(*it, byte_index)];
+  }
+
+  // Single-bucket skip: if every row shares this byte, recurse without moving any data.
+  if (count[radix_byte_at(*begin, byte_index)] == row_count) {
+    msd_radix_sort(begin, end, res, byte_index + 1, key_size);
+    return;
+  }
+
+  auto bucket_start = std::array<size_t, RADIX_BUCKET_SIZE>{};
+  // Prefix sum to get each bucket start index in the output array.
+  auto running = size_t{0};
+  for (auto bucket = size_t{0}; bucket < RADIX_BUCKET_SIZE; ++bucket) {
+    bucket_start[bucket] = running;
+    running += count[bucket];
+  }
+
+  auto cursor = bucket_start;  // copy: scatter cursors
+  for (auto* it = begin; it != end; ++it) {
+    res[cursor[radix_byte_at(*it, byte_index)]++] = *it;
+  }
+  std::copy(res, res + row_count, begin);
+
+  for (auto bucket = size_t{0}; bucket < RADIX_BUCKET_SIZE; ++bucket) {
+    if (count[bucket] > 1) {
+      msd_radix_sort(begin + bucket_start[bucket], begin + bucket_start[bucket] + count[bucket],
+                     res + bucket_start[bucket], byte_index + 1, key_size);
+    }
+  }
+}
+
+void lsd_radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res, size_t key_size) {
+  const auto row_count = static_cast<size_t>(end - begin);
+  if (row_count <= 1) {
+    return;
+  }
+  auto* src = begin;
+  auto* dst = res;
+  for (auto pass = size_t{0}; pass < key_size; ++pass) {
+    const auto byte_index = key_size - 1 - pass;  // least-significant byte first
+    auto count = std::array<size_t, RADIX_BUCKET_SIZE>{};
+    for (auto i = size_t{0}; i < row_count; ++i) {
+      ++count[radix_byte_at(src[i], byte_index)];
+    }
+    auto bucket_start = std::array<size_t, RADIX_BUCKET_SIZE>{};
+    auto running = size_t{0};
+    for (auto bucket = size_t{0}; bucket < RADIX_BUCKET_SIZE; ++bucket) {
+      bucket_start[bucket] = running;
+      running += count[bucket];
+    }
+    for (auto i = size_t{0}; i < row_count; ++i) {
+      dst[bucket_start[radix_byte_at(src[i], byte_index)]++] = src[i];
+    }
+    std::swap(src, dst);
+  }
+  if (src != begin) {  // odd number of passes: land the result back in `begin`
+    std::copy(src, src + row_count, begin);
+  }
+}
+
+// `res` must be at least (end - begin) long.
+void radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res, size_t key_size) {
+  if (end - begin <= 1) {
+    return;
+  }
+  if (key_size <= 4) {
+    lsd_radix_sort(begin, end, res, key_size);
+  } else {
+    msd_radix_sort(begin, end, res, 0, key_size);
+  }
+}
+
+/**
+ * Merge k sorted runs of NormalizedKeyRows into a single RowIDPosList using a loser tree.
+ * tree[0] holds the index of the run with the overall smallest head element, internal nodes 1 .. leaf_count - 1 each
+ * hold the run that lost the match played at that node, and leaf j conceptually sits at index leaf_count + j (leaves
+ * are not stored; the current head of each run is tracked in a separate cursor array). After outputting the winner
+ * and advancing its cursor, only the losers stored on the winner's leaf-to-root path can beat the new head, so a
+ * replay costs exactly ceil(log2(k)) comparisons and one array access per level, without any sibling lookups. The
+ * merge thus performs O(n * log(k)) comparisons overall but reads and writes every row exactly once.
+ */
+// Writes exactly `row_count` RowIDs, in sorted order, into `output` (fusing the extraction step; the caller points
+// `output` at the partition's slice of the final position list).
+void merge_partition_of_sorted_runs(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
+                                    const size_t key_size, const size_t row_count, RowID* output) {
+  const auto run_count = runs.size();
+  DebugAssert(run_count > 0, "Expected at least one run.");
+
+  // Shortcut: a single run is already fully sorted.
+  if (run_count == 1) {
+    for (const auto* row = runs[0].first; row != runs[0].second; ++row) {
+      *output++ = row->row_id;
+    }
+    return;
+  }
+
+  // Pad the number of leaves to the next power of two so that the implicit tree indexing stays trivial. Padded runs
+  // are empty and therefore permanently exhausted; they sink to the bottom of the tree and never win.
+  const auto leaf_count = std::bit_ceil(run_count);
+
+  auto heads = std::vector<const NormalizedKeyRow*>(leaf_count, nullptr);
+  auto ends = std::vector<const NormalizedKeyRow*>(leaf_count, nullptr);
+  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
+    heads[run_index] = runs[run_index].first;
+    ends[run_index] = runs[run_index].second;
+  }
+
+  // Returns true if run lhs wins the match against run rhs (i.e., its head element sorts first). Exhausted runs
+  // always lose against non-exhausted runs. Ties (equal keys or two exhausted runs) are broken by the run index,
+  // which makes the merge deterministic and stable with respect to the run order.
+  const auto beats = [&](const size_t lhs, const size_t rhs) {
+    const auto lhs_exhausted = heads[lhs] == ends[lhs];
+    const auto rhs_exhausted = heads[rhs] == ends[rhs];
+    if (lhs_exhausted || rhs_exhausted) {
+      return !lhs_exhausted || (rhs_exhausted && lhs < rhs);
+    }
+    if (heads[lhs]->less_than(*heads[rhs], key_size)) {
+      return true;
+    }
+    if (heads[rhs]->less_than(*heads[lhs], key_size)) {
+      return false;
+    }
+    return lhs < rhs;
+  };
+
+  // Build the tree bottom-up in O(k): play all matches, propagate the winners upward, and store the losers.
+  auto tree = std::vector<size_t>(leaf_count, size_t{0});
+  auto winners = std::vector<size_t>(2 * leaf_count, size_t{0});
+  for (auto leaf = size_t{0}; leaf < leaf_count; ++leaf) {
+    winners[leaf_count + leaf] = leaf;
+  }
+  for (auto node = leaf_count - 1; node >= 1; --node) {
+    const auto left = winners[2 * node];
+    const auto right = winners[(2 * node) + 1];
+    winners[node] = beats(left, right) ? left : right;
+    tree[node] = (winners[node] == left) ? right : left;
+  }
+  tree[0] = winners[1];
+
+  // Repeatedly output the winner's head, advance the winner's cursor, and replay the matches on its leaf-to-root
+  // path: whenever a stored loser beats the new candidate, they swap places and the old loser moves up.
+  for (auto output_index = size_t{0}; output_index < row_count; ++output_index) {
+    const auto winner = tree[0];
+    DebugAssert(heads[winner] != ends[winner], "Winning run must not be exhausted while rows are left to merge.");
+    *output++ = heads[winner]->row_id;
+    ++heads[winner];
+
+    auto candidate = winner;
+    for (auto node = (leaf_count + winner) / 2; node >= 1; node /= 2) {
+      if (beats(tree[node], candidate)) {
+        std::swap(tree[node], candidate);
+      }
+    }
+    tree[0] = candidate;
+  }
+}
+
+// Sequential K-way Merge Path: find how many elements of each run fall in the first `target` merged outputs,
+// i.e. the flat frontier. Lower-run-index breaks ties, matching merge_partition_of_sorted_runs. NOTE: the peek is offset+step-1
+// (last element TAKEN), not the blog's offset+delta -- the latter is off-by-one on the flat-frontier condition.
+// `start_offsets` is a valid frontier (its elements sum to some C); this advances it by `advance_by` more output
+// elements and returns the frontier for C + advance_by. Seeding each boundary from the previous one makes the P-1
+// partition_boundaries cost O(N) work overall instead of O(P*N), at the cost of computing them sequentially.
+std::vector<size_t> compute_intersections(
+    const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& sorted_runs, const size_t key_size,
+    std::vector<size_t> intersections, size_t advance_by) {
+  const auto run_count = sorted_runs.size();
+
+  while (advance_by != 0) {
+    const auto delta = div_ceil(advance_by, run_count);
+
+    auto min_idx = run_count;
+    const NormalizedKeyRow* min_val = nullptr;
+    for (size_t run_idx = 0; run_idx < run_count; ++run_idx) {
+      const auto length = static_cast<size_t>(sorted_runs[run_idx].second - sorted_runs[run_idx].first);
+      if (intersections[run_idx] >= length) {
+        continue;                                      // exhausted run
+      }
+      const auto step = std::min(delta, length - intersections[run_idx]);
+      // peek at the LAST element this advance takes (offset+step-1)
+      const auto* val = sorted_runs[run_idx].first + intersections[run_idx] + step - 1;
+      if (min_idx == run_count || val->less_than(*min_val, key_size)) {
+        min_idx = run_idx;
+        min_val = val;
+      }
+    }
+
+    const auto step = std::min(delta, static_cast<size_t>(sorted_runs[min_idx].second - sorted_runs[min_idx].first)
+                                          - intersections[min_idx]);
+    intersections[min_idx] += step;
+    advance_by -= step;
+  }
+  return intersections;
+}
+
+// Compute the frontier for the first `advance_by` merged outputs: how many elements of each run precede it.
+// Each boundary is computed independently from zero, so the P-1 boundaries can be found in parallel (DuckDB k-way
+// merge-path design).
+// std::vector<size_t> compute_intersections_parallel(
+//     const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& sorted_runs, const size_t key_size,
+//     size_t advance_by) {
+//   const auto run_count = sorted_runs.size();
+//   auto intersections = std::vector<size_t>(run_count, 0);
+
+//   while (advance_by != 0) {
+//     const auto delta = div_ceil(advance_by, run_count);
+
+//     auto min_idx = run_count;  // "unset" sentinel so exhausted runs can be skipped
+//     const NormalizedKeyRow* min_val = nullptr;
+//     for (auto run_idx = size_t{0}; run_idx < run_count; ++run_idx) {
+//       const auto length = static_cast<size_t>(sorted_runs[run_idx].second - sorted_runs[run_idx].first);
+//       if (intersections[run_idx] >= length) {
+//         continue;  // exhausted run is not eligible
+//       }
+//       const auto step = std::min(delta, length - intersections[run_idx]);
+//       const auto* val = sorted_runs[run_idx].first + intersections[run_idx] + step - 1;
+//       // Ascending scan keeps the lowest index on ties, so only a strictly smaller key replaces the best.
+//       if (min_idx == run_count || val->less_than(*min_val, key_size)) {
+//         min_idx = run_idx;
+//         min_val = val;
+//       }
+//     }
+
+//     const auto step =
+//         std::min(delta, static_cast<size_t>(sorted_runs[min_idx].second - sorted_runs[min_idx].first) -
+//                             intersections[min_idx]);
+//     intersections[min_idx] += step;
+//     advance_by -= step;
+//   }
+//   return intersections;
+// }
+
+// Parallel k-way merge: split the output into MERGE_PATH_PARTITION_SIZE-sized chunks via compute_intersections, then
+// merge each chunk from the k sub-runs independently (reusing merge_partition_of_sorted_runs). Single pass over the data.
+RowIDPosList parallel_k_way_merge(
+    const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
+    const size_t row_count) {
+  auto position_list = RowIDPosList(row_count);
+  if (row_count == 0) {
+    return position_list;
+  }
+
+  const auto run_count = runs.size();
+  const auto partitions_count = std::clamp(div_ceil(row_count, MERGE_PATH_PARTITION_SIZE), size_t{1}, row_count);
+
+  // partition_boundaries[p][run] = elements of `run` consumed by output position row_count * p / partitions_count.
+  auto partition_boundaries = std::vector<std::vector<size_t>>(partitions_count + 1);
+  partition_boundaries.front() = std::vector<size_t>(run_count, 0);
+  partition_boundaries.back() = std::vector<size_t>(run_count);
+  for (auto run = size_t{0}; run < run_count; ++run) {
+    partition_boundaries.back()[run] = static_cast<size_t>(runs[run].second - runs[run].first);
+  }
+
+  // Compute the internal partition_boundaries sequentially, each seeded from the previous frontier (cheap).
+  for (auto partition = size_t{1}; partition < partitions_count; ++partition) {
+    const auto advance_by = row_count * partition / partitions_count - row_count * (partition - 1) / partitions_count;
+    partition_boundaries[partition] = compute_intersections(runs, key_size, partition_boundaries[partition - 1], advance_by);
+  }
+  // Compute the internal partition boundaries independently and in parallel (matches the DuckDB k-way merge-path design).
+  // auto boundary_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+  // boundary_tasks.reserve(partitions_count - 1);
+  // for (auto partition = size_t{1}; partition < partitions_count; ++partition) {
+  //   boundary_tasks.emplace_back(std::make_shared<JobTask>([&, partition]() {
+  //     partition_boundaries[partition] = compute_intersections_parallel(runs, key_size, row_count * partition / partitions_count);
+  //   }));
+  // }
+  // Hyrise::get().scheduler()->schedule_and_wait_for_tasks(boundary_tasks);
+  // ----------------
+  // Merge each partition independently and in parallel, writing RowIDs straight into its slice of position_list.
+  auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+  merge_tasks.reserve(partitions_count);
+  for (auto partition = size_t{0}; partition < partitions_count; ++partition) {
+    merge_tasks.emplace_back(std::make_shared<JobTask>([&, partition]() {
+      const auto out_begin = row_count * partition / partitions_count;
+      const auto out_end = row_count * (partition + 1) / partitions_count;
+      // #2: skip runs that contribute nothing to this partition, so the loser tree is only as deep as the live runs.
+      auto sub_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
+      sub_runs.reserve(run_count);
+      for (auto run = size_t{0}; run < run_count; ++run) {
+        const auto* sub_begin = runs[run].first + partition_boundaries[partition][run];
+        const auto* sub_end = runs[run].first + partition_boundaries[partition + 1][run];
+        if (sub_begin != sub_end) {
+          sub_runs.emplace_back(sub_begin, sub_end);
+        }
+      }
+      if (!sub_runs.empty()) {
+        merge_partition_of_sorted_runs(sub_runs, key_size, out_end - out_begin, position_list.data() + out_begin);
+      }
+    }));
+  }
+  Hyrise::get().scheduler()->schedule_and_wait_for_tasks(merge_tasks);
+  return position_list;
+}
+
 
 // Map signed to unsigned data types with same number of bytes (e.g., int32_t to uint32_t).
 template <typename T>
@@ -709,14 +1076,16 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   // next step. The performance improves by about 10%.
   auto materialized_rows = uninitialized_vector<NormalizedKeyRow>(input_table->row_count());
 
-  // Create list of chunks to materialize.
+  // Create list of chunks to materialize. The vector holds one extra sentinel entry (the total row count) so that
+  // the rows of chunk i always span [chunk_offsets[i], chunk_offsets[i + 1]).
   auto total_offset = size_t{0};
-  auto chunk_offsets = std::vector<size_t>(chunk_count);
+  auto chunk_offsets = std::vector<size_t>(static_cast<size_t>(chunk_count) + 1);
   for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
     const auto chunk_size = input_table->get_chunk(chunk_id)->size();
     chunk_offsets[chunk_id] = total_offset;
     total_offset += chunk_size;
   }
+  chunk_offsets[chunk_count] = total_offset;
 
   auto chunk_allocations = std::vector<uninitialized_vector<std::byte>>(chunk_count);
   auto materialization_tasks = std::vector<std::shared_ptr<AbstractTask>>();
@@ -751,32 +1120,62 @@ std::shared_ptr<const Table> Sort::_on_execute() {
         });
         key_offset += column_stats[index].width();
       }
+
+      // Fill the inline prefix now that all key bytes for this chunk exist.
+      normalized_key_iter = materialized_rows.begin() + chunk_offsets[chunk_id];
+      for (auto chunk_offset = ChunkOffset{0}; chunk_offset < chunk_size; ++chunk_offset, ++normalized_key_iter) {
+        normalized_key_iter->prefix = load_key_prefix(normalized_key_iter->key_head, normalized_key_size);
+      }
+
     }));
   }
   Hyrise::get().scheduler()->schedule_and_wait_for_tasks(materialization_tasks);
 
   const auto materialization_time = timer.lap();
 
-  boost::sort::pdqsort(materialized_rows.begin(), materialized_rows.end(),
-                       [normalized_key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
-                         return lhs.less_than(rhs, normalized_key_size);
-                       });
+  // Scratch buffer used only by the radix run generation (the k-way merge allocates its own buffers).
+  auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(USE_RADIX_SORT ? input_table->row_count() : size_t{0});
+
+  // Sort each chunk's slice of the materialized rows independently and in parallel. Every chunk becomes a sorted run
+  // for the subsequent merge (run generation / sink phase). Radix sort vs. pdqsort is selected via USE_RADIX_SORT.
+  auto sort_run_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+  sort_run_tasks.reserve(chunk_count);
+  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
+    sort_run_tasks.emplace_back(std::make_shared<JobTask>([&, run_index]() {
+      auto* run_begin = materialized_rows.data() + chunk_offsets[run_index];
+      auto* run_end = materialized_rows.data() + chunk_offsets[run_index + 1];
+      if constexpr (USE_RADIX_SORT) {
+        auto* run_scratch = sort_scratch.data() + chunk_offsets[run_index];
+        radix_sort(run_begin, run_end, run_scratch, normalized_key_size);
+      } else {
+        boost::sort::pdqsort(run_begin, run_end,
+                             [normalized_key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
+                               return lhs.less_than(rhs, normalized_key_size);
+                             });
+      }
+    }));
+  }
+  Hyrise::get().scheduler()->schedule_and_wait_for_tasks(sort_run_tasks);
 
   const auto sort_time = timer.lap();
 
-  // Extract the positions from the sorted rows.
-  auto position_list = RowIDPosList();
-  position_list.reserve(materialized_rows.size());
-  for (const auto& row : materialized_rows) {
-    position_list.push_back(row.row_id);
+  // Merge the k sorted runs (k = chunk count) into the final position list. 
+  auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
+  runs.reserve(chunk_count);
+  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
+    runs.emplace_back(materialized_rows.data() + chunk_offsets[run_index],
+                      materialized_rows.data() + chunk_offsets[run_index + 1]);
   }
+  auto position_list = parallel_k_way_merge(runs, normalized_key_size, materialized_rows.size());
 
-  const auto write_back_time = timer.lap();
+  const auto merge_time = timer.lap();
 
-  // TODO(student): Update performance metrics.
+  // Note: Sort covers the parallel run generation, while TemporaryResultWriting covers the merge (which also
+  // writes the temporary result, i.e., the position list). Consider extending OperatorSteps with a dedicated
+  // MergeSortedRuns step for a cleaner phase breakdown.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
   step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, write_back_time);
+  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
