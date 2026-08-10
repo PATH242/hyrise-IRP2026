@@ -32,6 +32,7 @@
 #include "resolve_type.hpp"
 #include "scheduler/abstract_task.hpp"
 #include "scheduler/job_task.hpp"
+#include "scheduler/node_queue_scheduler.hpp"
 #include "scheduler/operator_task.hpp"
 #include "storage/abstract_segment.hpp"
 #include "storage/base_segment_accessor.hpp"
@@ -62,9 +63,14 @@ auto div_ceil(const auto left, const auto right) {
 // Run generation: radix sort (this file) vs. pdqsort.
 constexpr bool USE_RADIX_SORT = true;
 
-// A pairwise is split into ceil(total / MERGE_PATH_PARTITION_SIZE) independent tasks so that even the
-// final merges use every core. A value >= total yields a single (serial) merge.
-constexpr size_t MERGE_PATH_PARTITION_SIZE = size_t{1} << 16;
+// Adaptive merge partitioning (see parallel_binary_merge): when true, each level targets a total task count of
+// MERGE_TASKS_PER_WORKER * workers. Merge_path splitting is skipped entirely on wide levels (pair_count already >=
+// target). When false, every pair is split into ceil(target / pair_count) partitions, regardless of level width.
+constexpr bool ADAPTIVE_MERGE_PARTITIONING = true;
+constexpr size_t MERGE_TASKS_PER_WORKER = 4;
+
+// Minimum rows per merge-path partition. 
+constexpr size_t MERGE_PATH_MIN_PARTITION_SIZE = size_t{1} << 16;
 
 // Radix sort tuning constants.
 constexpr size_t RADIX = 256;
@@ -441,6 +447,15 @@ size_t merge_path(const NormalizedKeyRow* a, size_t len_a, const NormalizedKeyRo
   return low;
 }
 
+// Number of parallel execution slots to fill.
+inline size_t merge_worker_target() {
+  const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(Hyrise::get().scheduler());
+  if (node_queue_scheduler) {
+    return static_cast<size_t>(std::max(int64_t{1}, node_queue_scheduler->active_worker_count().load()));
+  }
+  return std::max<size_t>(size_t{1}, Hyrise::get().topology.num_cpus());
+}
+
 // Cascaded 2-way merge with Merge Path parallelism (old DuckDB design). `src` holds the sorted runs delimited by
 // `boundaries` (size = run_count + 1, last entry == row_count); `scratch` is a same-sized buffer. The two buffers
 // ping-pong across levels; the fully merged run is extracted into the returned position list.
@@ -449,8 +464,13 @@ RowIDPosList parallel_binary_merge(NormalizedKeyRow* src, NormalizedKeyRow* scra
   auto* current = src;
   auto* other = scratch;
 
+  const auto worker_target = merge_worker_target();
+  const auto task_target = MERGE_TASKS_PER_WORKER * worker_target;
+
   while (boundaries.size() > 2) {  // more than one run remaining
     const auto run_count = boundaries.size() - 1;
+    const auto pair_count = run_count / 2;
+
     auto next_boundaries = std::vector<size_t>();
     auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
 
@@ -466,7 +486,20 @@ RowIDPosList parallel_binary_merge(NormalizedKeyRow* src, NormalizedKeyRow* scra
         continue;
       }
 
-      const auto partitions = std::clamp(div_ceil(total, MERGE_PATH_PARTITION_SIZE), size_t{1}, total);
+      auto partitions = size_t{1};
+      if constexpr (ADAPTIVE_MERGE_PARTITIONING) {
+        // Wide level (pair_count >= task_target): one task per pair, merge_path skipped. Narrow level: split each
+        // pair so the level reaches ~task_target tasks, capped so partitions never shrink below the size floor.
+        if (pair_count < task_target) {
+          const auto want = div_ceil(task_target, std::max<size_t>(1, pair_count));
+          const auto size_cap = std::max<size_t>(1, div_ceil(total, MERGE_PATH_MIN_PARTITION_SIZE));
+          partitions = std::clamp(std::min(want, size_cap), size_t{1}, total);
+        }
+      } else {
+        // Always-split baseline: fixed-size partitions at every level.
+        partitions = std::clamp(div_ceil(total, MERGE_PATH_MIN_PARTITION_SIZE), size_t{1}, total);
+      }
+
       for (auto partition = size_t{0}; partition < partitions; ++partition) {
         merge_tasks.emplace_back(std::make_shared<JobTask>(
             [current, other, a_begin, b_begin, len_a, len_b, total, partition, partitions, key_size]() {
@@ -1011,7 +1044,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   const auto sort_time = timer.lap();
 
   // Merge the k sorted runs (k = chunk count) into the final position list.
-  // Cascaded 2-way parallel binary merge (Merge Path).
+  // Cascaded 2-way parallel binary merge (Merge Path), worker-gated.
   auto position_list = parallel_binary_merge(materialized_rows.data(), sort_scratch.data(), chunk_offsets,
                                              normalized_key_size, materialized_rows.size());
 
