@@ -1,0 +1,12 @@
+{
+  "label": "kway_radix",
+  "binary": "./cmake-build-release/hyriseMicroBenchmarks",
+  "git_branch": "k-way-merge-sort",
+  "git_rev": "970ffc08e",
+  "git_state": "dirty",
+  "host": "sidon",
+  "numa_node": "1",
+  "filter": "^Sort/",
+  "repetitions": 5,
+  "started": "2026-09-05T18:44:31Z"
+}

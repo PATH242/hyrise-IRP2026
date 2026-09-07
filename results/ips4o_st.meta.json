@@ -1,0 +1,12 @@
+{
+  "label": "ips4o_st",
+  "binary": "cmake-build-release/hyriseMicroBenchmarks",
+  "git_branch": "HEAD",
+  "git_rev": "8d1791717",
+  "git_state": "dirty",
+  "host": "sidon",
+  "numa_node": "1",
+  "filter": "/mt0/",
+  "repetitions": 5,
+  "started": "2026-09-06T16:50:41Z"
+}

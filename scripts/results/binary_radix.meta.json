@@ -1,0 +1,12 @@
+{
+  "label": "binary_radix",
+  "binary": "./cmake-build-release/hyriseMicroBenchmarks",
+  "git_branch": "duckdb-sort",
+  "git_rev": "3dd6033eb",
+  "git_state": "dirty",
+  "host": "sidon",
+  "numa_node": "1",
+  "filter": "^Sort/",
+  "repetitions": 5,
+  "started": "2026-09-05T20:46:19Z"
+}

@@ -1,0 +1,10 @@
+2026-09-06T00:11:51+02:00
+Running cmake-build-release/hyriseMicroBenchmarks
+Run on (120 X 3100 MHz CPU s)
+CPU Caches:
+  L1 Data 32 KiB (x60)
+  L1 Instruction 32 KiB (x60)
+  L2 Unified 256 KiB (x60)
+  L3 Unified 38400 KiB (x4)
+Load Average: 0.29, 2.11, 3.70
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.

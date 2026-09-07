@@ -1,0 +1,12 @@
+{
+  "label": "base",
+  "binary": "cmake-build-release/hyriseMicroBenchmarks",
+  "git_branch": "master",
+  "git_rev": "c474bbdd8",
+  "git_state": "dirty",
+  "host": "sidon",
+  "numa_node": "1",
+  "filter": "/mt0/",
+  "repetitions": 5,
+  "started": "2026-09-05T22:11:51Z"
+}

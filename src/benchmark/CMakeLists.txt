@@ -15,6 +15,7 @@ add_executable(
     operators/projection_benchmark.cpp
     operators/union_positions_benchmark.cpp
     operators/sort_benchmark.cpp
+    operators/merge_sort_benchmark.cpp
     operators/sql_benchmark.cpp
     operators/table_scan_benchmark.cpp
     operators/table_scan_sorted_benchmark.cpp
