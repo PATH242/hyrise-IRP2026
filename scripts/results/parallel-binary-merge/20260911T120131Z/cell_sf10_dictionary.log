@@ -1,0 +1,7 @@
+routine=parallel-binary-merge sf=10 encoding=dictionary runs=11 (1 warm-up) -> /home/Mennatullah.Awadallah/hyrise-IRP2026/scripts/results/parallel-binary-merge/20260911T120131Z/sort_results.csv
+  operator: payload=1 (1 columns)
+  operator: payload=4 (4 columns)
+  operator: payload=8 (8 columns)
+  operator: payload=all (15 columns)
+  sql: SELECT * FROM lineitem ORDER BY l_shipdate;
+appended to /home/Mennatullah.Awadallah/hyrise-IRP2026/scripts/results/parallel-binary-merge/20260911T120131Z/sort_results.csv
