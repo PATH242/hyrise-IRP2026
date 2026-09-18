@@ -31,8 +31,22 @@ add_executable(
     dyod_evaluation.cpp
 )
 
+add_executable(
+    SortEvaluation
+
+    sort_evaluation.cpp
+)
+
+
 target_link_libraries(
     hyriseDYODEvaluation
+
+    hyrise
+    hyriseBenchmarkLib
+)
+
+target_link_libraries(
+    SortEvaluation
 
     hyrise
     hyriseBenchmarkLib
