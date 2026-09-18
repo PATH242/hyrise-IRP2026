@@ -45,6 +45,7 @@
 #include "types.hpp"
 #include "utils/assert.hpp"
 #include "utils/timer.hpp"
+#include "scheduler/node_queue_scheduler.hpp" 
 
 namespace {
 
@@ -61,10 +62,6 @@ auto div_ceil(const auto left, const auto right) {
 
 // Run generation: radix sort vs. pdqsort.
 constexpr bool USE_RADIX_SORT = true;
-
-// A pairwise/k-way merge is split into ceil(total / MERGE_PATH_PARTITION_SIZE) independent tasks so that even the
-// final merges use every core. A value >= total yields a single (serial) merge.
-constexpr size_t MERGE_PATH_PARTITION_SIZE = size_t{1} << 16;
 
 // Radix sort tuning constants.
 constexpr size_t RADIX_BUCKET_SIZE = 256;
@@ -585,42 +582,67 @@ std::vector<size_t> compute_intersections(
 //   return intersections;
 // }
 
-// Parallel k-way merge: split the output into MERGE_PATH_PARTITION_SIZE-sized chunks via compute_intersections, then
-// merge each chunk from the k sub-runs independently (reusing merge_partition_of_sorted_runs). Single pass over the data.
-RowIDPosList parallel_k_way_merge(
+// Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine
+// instead of the input size (the previous fixed partition size made the partition count a function of the row count,
+// which left workers idle on small inputs and produced a ragged final wave on medium ones). Falls back to a single
+// partition when no worker-based scheduler is set (active_worker_count() == 0 under the ImmediateExecutionScheduler),
+// which keeps the merge correct and serial. Never exceeds row_count, so every partition emits at least one row.
+size_t determine_merge_partition_count(const size_t row_count) {
+  auto worker_count = size_t{1};
+  const auto& scheduler = Hyrise::get().scheduler();
+  if (const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(scheduler)) {
+    worker_count = static_cast<size_t>(node_queue_scheduler->active_worker_count());
+  }
+  return std::clamp(worker_count, size_t{1}, row_count);
+}
+
+// Merge path for the k-way merge: compute the partition boundaries only, so that this phase can be timed separately
+// from the merge itself (OperatorSteps::MergePath vs. OperatorSteps::MergeSortedRuns).
+//
+// boundaries[p][run] = elements of `run` consumed by output position row_count * p / partition_count. Two consecutive
+// boundaries bound one output partition. The first and last boundary are known without any comparisons; the internal
+// ones are computed sequentially, each seeded from the previous frontier, which costs O(N) in total instead of the
+// O(P*N) of computing every boundary independently from zero (see compute_intersections_parallel above).
+std::vector<std::vector<size_t>> compute_merge_path_boundaries(
     const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
-    const size_t row_count) {
+    const size_t row_count, const size_t partition_count) {
+  auto boundaries = std::vector<std::vector<size_t>>();
+  if (row_count == 0 || partition_count == 0) {
+    return boundaries;
+  }
+
+  const auto run_count = runs.size();
+
+  boundaries.resize(partition_count + 1);
+  boundaries.front() = std::vector<size_t>(run_count, 0);
+  boundaries.back() = std::vector<size_t>(run_count);
+  for (auto run = size_t{0}; run < run_count; ++run) {
+    boundaries.back()[run] = static_cast<size_t>(runs[run].second - runs[run].first);
+  }
+
+  for (auto partition = size_t{1}; partition < partition_count; ++partition) {
+    const auto advance_by = row_count * partition / partition_count - row_count * (partition - 1) / partition_count;
+    boundaries[partition] = compute_intersections(runs, key_size, boundaries[partition - 1], advance_by);
+  }
+
+  return boundaries;
+}
+
+// Parallel k-way merge: merge each output partition delimited by `boundaries` independently, writing RowIDs straight
+// into that partition's slice of the position list (reusing merge_partition_of_sorted_runs). Single pass over the
+// data. The boundaries are precomputed by compute_merge_path_boundaries so that the merge path is its own phase.
+RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
+                              const size_t key_size, const size_t row_count,
+                              const std::vector<std::vector<size_t>>& boundaries) {
   auto position_list = RowIDPosList(row_count);
   if (row_count == 0) {
     return position_list;
   }
 
   const auto run_count = runs.size();
-  const auto partitions_count = std::clamp(div_ceil(row_count, MERGE_PATH_PARTITION_SIZE), size_t{1}, row_count);
+  DebugAssert(boundaries.size() >= 2, "Expected at least one partition for a non-empty input.");
+  const auto partitions_count = boundaries.size() - 1;
 
-  // partition_boundaries[p][run] = elements of `run` consumed by output position row_count * p / partitions_count.
-  auto partition_boundaries = std::vector<std::vector<size_t>>(partitions_count + 1);
-  partition_boundaries.front() = std::vector<size_t>(run_count, 0);
-  partition_boundaries.back() = std::vector<size_t>(run_count);
-  for (auto run = size_t{0}; run < run_count; ++run) {
-    partition_boundaries.back()[run] = static_cast<size_t>(runs[run].second - runs[run].first);
-  }
-
-  // Compute the internal partition_boundaries sequentially, each seeded from the previous frontier (cheap).
-  for (auto partition = size_t{1}; partition < partitions_count; ++partition) {
-    const auto advance_by = row_count * partition / partitions_count - row_count * (partition - 1) / partitions_count;
-    partition_boundaries[partition] = compute_intersections(runs, key_size, partition_boundaries[partition - 1], advance_by);
-  }
-  // Compute the internal partition boundaries independently and in parallel (matches the DuckDB k-way merge-path design).
-  // auto boundary_tasks = std::vector<std::shared_ptr<AbstractTask>>();
-  // boundary_tasks.reserve(partitions_count - 1);
-  // for (auto partition = size_t{1}; partition < partitions_count; ++partition) {
-  //   boundary_tasks.emplace_back(std::make_shared<JobTask>([&, partition]() {
-  //     partition_boundaries[partition] = compute_intersections_parallel(runs, key_size, row_count * partition / partitions_count);
-  //   }));
-  // }
-  // Hyrise::get().scheduler()->schedule_and_wait_for_tasks(boundary_tasks);
-  // ----------------
   // Merge each partition independently and in parallel, writing RowIDs straight into its slice of position_list.
   auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
   merge_tasks.reserve(partitions_count);
@@ -632,8 +654,8 @@ RowIDPosList parallel_k_way_merge(
       auto sub_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
       sub_runs.reserve(run_count);
       for (auto run = size_t{0}; run < run_count; ++run) {
-        const auto* sub_begin = runs[run].first + partition_boundaries[partition][run];
-        const auto* sub_end = runs[run].first + partition_boundaries[partition + 1][run];
+        const auto* sub_begin = runs[run].first + boundaries[partition][run];
+        const auto* sub_end = runs[run].first + boundaries[partition + 1][run];
         if (sub_begin != sub_end) {
           sub_runs.emplace_back(sub_begin, sub_end);
         }
@@ -1159,24 +1181,34 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto sort_time = timer.lap();
 
-  // Merge the k sorted runs (k = chunk count) into the final position list. 
+  // Merge the k sorted runs (k = chunk count) into the final position list.
   auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
   runs.reserve(chunk_count);
   for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
     runs.emplace_back(materialized_rows.data() + chunk_offsets[run_index],
                       materialized_rows.data() + chunk_offsets[run_index + 1]);
   }
-  auto position_list = parallel_k_way_merge(runs, normalized_key_size, materialized_rows.size());
+
+  // Merge path: one partition per active worker, computed as its own phase so that the cost of finding the
+  // boundaries is reported separately from the cost of merging.
+  const auto merge_partition_count = determine_merge_partition_count(materialized_rows.size());
+  const auto merge_path_boundaries =
+      compute_merge_path_boundaries(runs, normalized_key_size, materialized_rows.size(), merge_partition_count);
+
+  const auto merge_path_time = timer.lap();
+
+  auto position_list =
+      merge_partitions(runs, normalized_key_size, materialized_rows.size(), merge_path_boundaries);
 
   const auto merge_time = timer.lap();
 
-  // Note: Sort covers the parallel run generation, while TemporaryResultWriting covers the merge (which also
-  // writes the temporary result, i.e., the position list). Consider extending OperatorSteps with a dedicated
-  // MergeSortedRuns step for a cleaner phase breakdown.
+  // Note: Sort covers the parallel run generation, MergePath the computation of the merge-path partition boundaries,
+  // and TemporaryResultWriting the merge itself (which also writes the temporary result, i.e., the position list).
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
   step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
+  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
