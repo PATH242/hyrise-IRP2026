@@ -21,7 +21,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- configuration ---------------------------------------------------------------------------------------------
 HYRISE_ROOT="${HYRISE_ROOT:-${HOME}/hyrise-IRP2026}"
-BINARY="${BINARY:-${HYRISE_ROOT}/cmake-build-release/sort_evaluation}"
+BINARY="${BINARY:-${HYRISE_ROOT}/cmake-build-release/SortEvaluation}"
 
 NUMA_NODE="${NUMA_NODE:-1}"
 RUNS="${RUNS:-11}"                       # first run is a discarded warm-up

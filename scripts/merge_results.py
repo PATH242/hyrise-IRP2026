@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge per-branch sort_evaluation CSVs into one file for plot_results.py.
+"""Merge per-branch SortEvaluation CSVs into one file for plot_results.py.
 
     python3 merge_results.py ~/sort-results/raw -o ~/sort-results/all_results.csv
 
@@ -39,7 +39,7 @@ def main() -> int:
     output = args.output or args.indir.parent / "all_results.csv"
 
     # Any filename works, with or without a .csv extension -- identity lives in the rows, not the name.
-    # A file only counts if its header actually looks like sort_evaluation output.
+    # A file only counts if its header actually looks like SortEvaluation output.
     def is_results_file(path: Path) -> bool:
         if not path.is_file() or path.suffix not in ("", ".csv") or path.resolve() == output.resolve():
             return False
@@ -51,7 +51,7 @@ def main() -> int:
 
     files = sorted(p for p in args.indir.rglob("*") if is_results_file(p))
     if not files:
-        sys.exit(f"no sort_evaluation CSVs under {args.indir} "
+        sys.exit(f"no SortEvaluation CSVs under {args.indir} "
                  "(expected files whose first line starts with 'ROUTINE,')")
 
     # --- read, dropping files that are byte-identical copies of one already seen -------------------------------
