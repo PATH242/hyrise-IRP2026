@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "benchmark_config.hpp"
-#include "encoding_config.hpp"
 #include "hyrise.hpp"
 #include "operators/abstract_operator.hpp"
 #include "operators/get_table.hpp"
@@ -29,7 +28,6 @@
 #include "sql/sql_pipeline_builder.hpp"
 #include "sql/sql_pipeline_statement.hpp"
 #include "storage/chunk.hpp"
-#include "storage/encoding_type.hpp"
 #include "storage/table.hpp"
 #include "tpch/tpch_constants.hpp"
 #include "tpch/tpch_table_generator.hpp"
@@ -41,11 +39,11 @@ using namespace hyrise;  // NOLINT(build/namespaces)
 // =====================================================================================================================
 // Isolated-sort evaluation of Hyrise sort routines, structured as the DuckDB v1.4.0 "Sorting Again" blog analog.
 //
-// One process handles exactly ONE (routine, scale factor, encoding) cell. That is deliberate:
-//   * Hyrise caches generated tables in a CWD-relative `tpch_cached_tables/sf-<sf>` directory and encodes BEFORE
-//     writing that cache, so two encodings in one process (or one working directory) silently clobber each other.
+// One process handles exactly ONE (routine, scale factor) cell. That is deliberate:
+//   * Hyrise caches generated tables in a CWD-relative `tpch_cached_tables/sf-<sf>` directory, so all runs of all
+//     routines share one cache and are provably measured on identical input bytes.
 //   * Two scale factors in one process would register `lineitem` twice in the StorageManager.
-// run_evaluation.sh loops over the cells and gives each its own working directory.
+// run_evaluation.sh loops over the scale factors from one shared working directory.
 //
 // Two harnesses:
 //   operator  Sort driven directly (GetTable + column pruning + ForceMaterialization::Yes). This is the payload-cost
@@ -104,6 +102,13 @@ constexpr auto TABLE_NAME = "lineitem";
 constexpr auto SORT_KEY = "l_shipdate";
 constexpr auto SQL_QUERY = "SELECT * FROM lineitem ORDER BY l_shipdate;";
 
+// Encoding is no longer an axis: BenchmarkConfig::encoding_config is left at its default, which is Hyrise's own
+// "Automatic" setting (the default of hyriseBenchmarkTPCH). Note this is NOT "unencoded" -- with no preferred spec,
+// auto_select_segment_encoding_spec picks PER COLUMN: Unencoded for unique-valued columns, FrameOfReference for Int,
+// Dictionary for everything else. It is deterministic and identical across routines, so the comparison stays fair,
+// but lineitem ends up with a mix, which is worth one sentence in the paper. Recorded in the CSV for the record.
+constexpr auto ENCODING_TAG = "automatic";
+
 // lineitem's non-key columns in table order. Payload width N takes the first N of these; "all" takes every one.
 // NOTE: widths 1/4/8 are all fixed-width (int32/float); the jump to "all" also introduces the string columns, so that
 // step changes payload width AND payload type at once. Keep that in mind when reading the WRITE_OUT_US curve.
@@ -124,7 +129,6 @@ struct Options {
   std::vector<std::string> harnesses{"operator", "sql"};
   std::vector<std::string> payload_widths{"1", "4", "8", "all"};
   float scale_factor = 1.0F;
-  std::string encoding_name = "dictionary";
   size_t run_count = 11;  // first run is a discarded warm-up
 };
 
@@ -132,7 +136,6 @@ static void print_usage() {
   std::cout << "usage: sort_evaluation --routine <tag> [options]\n"
             << "  --routine  <tag>                 required; identifies the sort implementation in the CSV\n"
             << "  --sf       <float>               scale factor (default 1)\n"
-            << "  --encoding <dictionary|unencoded> input encoding (default dictionary)\n"
             << "  --harness  <operator[,sql]>      which harnesses to run (default operator,sql)\n"
             << "  --payload  <1,4,8,all>           payload widths for the operator harness\n"
             << "  --runs     <n>                   total runs; the first is a discarded warm-up (default 11)\n"
@@ -167,8 +170,6 @@ static Options parse_options(int argc, char* argv[]) {
       options.routine = next();
     } else if (flag == "--sf") {
       options.scale_factor = std::stof(next());
-    } else if (flag == "--encoding") {
-      options.encoding_name = next();
     } else if (flag == "--harness") {
       options.harnesses = split(next(), ',');
     } else if (flag == "--payload") {
@@ -194,18 +195,9 @@ static Options parse_options(int argc, char* argv[]) {
   }
 
   Assert(!options.routine.empty(), "--routine is required");
-  Assert(options.encoding_name == "dictionary" || options.encoding_name == "unencoded",
-         "--encoding must be 'dictionary' or 'unencoded'");
   Assert(options.run_count >= 2, "--runs must be at least 2 (one warm-up plus one measured run)");
 
   return options;
-}
-
-static EncodingConfig encoding_config_for(const std::string& name) {
-  if (name == "unencoded") {
-    return EncodingConfig::unencoded();
-  }
-  return EncodingConfig{SegmentEncodingSpec{EncodingType::Dictionary}};
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -381,7 +373,7 @@ static void append_samples(const Options& options, const std::string& harness, c
     const auto& sample = samples[run_id];
     out_file << std::format(R"("{}","{}","{}","{}","{}",{},"{}","{}",{},"{}",{},{},{},{})", options.routine,
                             options.branch, options.commit, options.machine, harness, materialized ? 1 : 0, TABLE_NAME,
-                            SORT_KEY, options.scale_factor, options.encoding_name, payload_columns, row_count, run_id,
+                            SORT_KEY, options.scale_factor, ENCODING_TAG, payload_columns, row_count, run_id,
                             sample.total_us);
     for (const auto phase_us : sample.phase_us) {
       out_file << ',' << phase_us;
@@ -395,7 +387,7 @@ int main(int argc, char* argv[]) {
   const auto options = parse_options(argc, argv);
 
   std::cout << std::format("routine={} sf={} encoding={} runs={} (1 warm-up) -> {}\n", options.routine,
-                           options.scale_factor, options.encoding_name, options.run_count, options.out_path);
+                           options.scale_factor, ENCODING_TAG, options.run_count, options.out_path);
 
   write_header_if_needed(options.out_path);
 
@@ -404,7 +396,6 @@ int main(int argc, char* argv[]) {
 
   auto benchmark_config = std::make_shared<BenchmarkConfig>();
   benchmark_config->cache_binary_tables = true;
-  benchmark_config->encoding_config = encoding_config_for(options.encoding_name);
   silent_tpch_generation(options.scale_factor, benchmark_config);
 
   for (const auto& harness : options.harnesses) {

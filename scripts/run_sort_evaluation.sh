@@ -1,17 +1,19 @@
-#!/usr/bin/env bash
+\#!/usr/bin/env bash
 # =====================================================================================================================
 # Drives sort_evaluation over the run matrix for ONE routine branch and files the output.
 #
 #   ./run_evaluation.sh --routine kway
 #   ./run_evaluation.sh --routine baseline --dry-run
-#   ./run_evaluation.sh --routine kway --cells 10:dictionary        # single cell
+#   ./run_evaluation.sh --routine kway --sf 10                      # single scale factor
 #
 # One invocation = one checked-out branch = one routine. Run it once per branch; results accumulate in a combined CSV.
 #
-# Table caches live in a SHARED working directory (one subdirectory per encoding, because Hyrise's table cache is
-# CWD-relative and encoding-specific). The first run for a given (sf, encoding) generates the tables; every later run --
-# including runs of other routines -- loads the identical cached bytes. That is what makes the input provably the same
-# across routines.
+# Table caches live in a SHARED working directory (Hyrise's table cache is CWD-relative). The first run for a given
+# scale factor generates the tables; every later run -- including runs of other routines -- loads the identical cached
+# bytes. That is what makes the input provably the same across routines.
+#
+# Encoding is not an axis: the binary leaves BenchmarkConfig at its default, i.e. Hyrise's "Automatic" per-column
+# selection, the same thing hyriseBenchmarkTPCH does by default.
 # =====================================================================================================================
 set -uo pipefail
 
@@ -26,10 +28,10 @@ RUNS="${RUNS:-11}"                       # first run is a discarded warm-up
 PAYLOAD="${PAYLOAD:-1,4,8,all}"
 HARNESS="${HARNESS:-operator,sql}"
 
-# Run matrix, as "<scale factor>:<encoding>". Add "100:dictionary" here when SF 100 becomes feasible.
-CELLS=("1:dictionary" "10:dictionary" "10:unencoded")
+# Run matrix: scale factors. Add 100 here when SF 100 becomes feasible.
+SCALE_FACTORS=(1 10)
 
-WORK_ROOT="${WORK_ROOT:-${HERE}/work}"          # shared table caches, one subdir per encoding
+WORK_ROOT="${WORK_ROOT:-${HERE}/work}"          # shared table cache directory
 RESULTS_ROOT="${RESULTS_ROOT:-${HERE}/results}"
 COMBINED_CSV="${RESULTS_ROOT}/all_results.csv"
 
@@ -41,7 +43,7 @@ ALLOW_DIRTY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --routine)     ROUTINE="$2"; shift 2 ;;
-    --cells)       IFS=',' read -r -a CELLS <<< "$2"; shift 2 ;;
+    --sf)          IFS=',' read -r -a SCALE_FACTORS <<< "$2"; shift 2 ;;
     --binary)      BINARY="$2"; shift 2 ;;
     --runs)        RUNS="$2"; shift 2 ;;
     --payload)     PAYLOAD="$2"; shift 2 ;;
@@ -84,15 +86,14 @@ log "routine   : ${ROUTINE}"
 log "source    : ${BRANCH} @ ${COMMIT}"
 log "binary    : ${BINARY}"
 log "machine   : ${MACHINE}, NUMA node ${NUMA_NODE}"
-log "cells     : ${CELLS[*]}"
+log "scale f.  : ${SCALE_FACTORS[*]}"
 log "payload   : ${PAYLOAD}   harness: ${HARNESS}   runs: ${RUNS}"
 log "output    : ${RUN_CSV}"
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  for cell in "${CELLS[@]}"; do
-    sf="${cell%%:*}"; enc="${cell##*:}"
-    echo "  DRY: (cd ${WORK_ROOT}/${enc} && numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE} ${BINARY}" \
-         "--routine ${ROUTINE} --sf ${sf} --encoding ${enc} --payload ${PAYLOAD} --harness ${HARNESS}" \
+  for sf in "${SCALE_FACTORS[@]}"; do
+    echo "  DRY: (cd ${WORK_ROOT} && numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE} ${BINARY}" \
+         "--routine ${ROUTINE} --sf ${sf} --payload ${PAYLOAD} --harness ${HARNESS}" \
          "--runs ${RUNS} --out ${RUN_CSV} --branch ${BRANCH} --commit ${COMMIT} --machine ${MACHINE})"
   done
   exit 0
@@ -112,7 +113,7 @@ mkdir -p "$RUN_DIR" "$RESULTS_ROOT"
   echo "binary         : ${BINARY}"
   echo "binary_sha256  : $(sha256sum "$BINARY" | cut -d' ' -f1)"
   echo "binary_mtime   : $(date -u -r "$BINARY" +%Y-%m-%dT%H:%M:%SZ)"
-  echo "cells          : ${CELLS[*]}"
+  echo "scale_factors  : ${SCALE_FACTORS[*]}"
   echo "payload_widths : ${PAYLOAD}"
   echo "harnesses      : ${HARNESS}"
   echo "runs_per_cell  : ${RUNS} (first discarded as warm-up)"
@@ -126,19 +127,15 @@ log "manifest  : ${MANIFEST}"
 
 # --- run -------------------------------------------------------------------------------------------------------
 failures=0
-for cell in "${CELLS[@]}"; do
-  sf="${cell%%:*}"
-  enc="${cell##*:}"
-  work_dir="${WORK_ROOT}/${enc}"
-  cell_log="${RUN_DIR}/cell_sf${sf}_${enc}.log"
+for sf in "${SCALE_FACTORS[@]}"; do
+  cell_log="${RUN_DIR}/cell_sf${sf}.log"
 
-  mkdir -p "$work_dir"
-  log "cell sf=${sf} encoding=${enc}  (cwd ${work_dir})"
+  mkdir -p "$WORK_ROOT"
+  log "cell sf=${sf}  (cwd ${WORK_ROOT})"
 
-  ( cd "$work_dir" && numactl "--cpunodebind=${NUMA_NODE}" "--membind=${NUMA_NODE}" "$BINARY" \
+  ( cd "$WORK_ROOT" && numactl "--cpunodebind=${NUMA_NODE}" "--membind=${NUMA_NODE}" "$BINARY" \
       --routine "$ROUTINE" \
       --sf "$sf" \
-      --encoding "$enc" \
       --payload "$PAYLOAD" \
       --harness "$HARNESS" \
       --runs "$RUNS" \
@@ -148,7 +145,7 @@ for cell in "${CELLS[@]}"; do
       --machine "$MACHINE" ) > "$cell_log" 2>&1
 
   if [[ $? -ne 0 ]]; then
-    warn "FAILED: sf=${sf} encoding=${enc} -- see ${cell_log}"
+    warn "FAILED: sf=${sf} -- see ${cell_log}"
     failures=$((failures + 1))
   fi
 done
