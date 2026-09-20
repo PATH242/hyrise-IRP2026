@@ -431,17 +431,25 @@ void radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow
  * replay costs exactly ceil(log2(k)) comparisons and one array access per level, without any sibling lookups. The
  * merge thus performs O(n * log(k)) comparisons overall but reads and writes every row exactly once.
  */
-// Writes exactly `row_count` RowIDs, in sorted order, into `output` (fusing the extraction step; the caller points
-// `output` at the partition's slice of the final position list).
+// Writes exactly `row_count` elements, in sorted order, into `output`. The output type selects what a level emits:
+// `RowID` for the final level (fusing the extraction step; the caller points `output` at the partition's slice of the
+// final position list) and `NormalizedKeyRow` for an intermediate level of a nested merge, whose result is itself a
+// run that the next level still has to compare.
+template <typename OutputType>
+  requires(std::is_same_v<OutputType, RowID> || std::is_same_v<OutputType, NormalizedKeyRow>)
 void merge_partition_of_sorted_runs(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
-                                    const size_t key_size, const size_t row_count, RowID* output) {
+                                    const size_t key_size, const size_t row_count, OutputType* output) {
   const auto run_count = runs.size();
   DebugAssert(run_count > 0, "Expected at least one run.");
 
   // Shortcut: a single run is already fully sorted.
   if (run_count == 1) {
     for (const auto* row = runs[0].first; row != runs[0].second; ++row) {
-      *output++ = row->row_id;
+      if constexpr (std::is_same_v<OutputType, RowID>) {
+        *output++ = row->row_id;
+      } else {
+        *output++ = *row;
+      }
     }
     return;
   }
@@ -494,7 +502,11 @@ void merge_partition_of_sorted_runs(const std::vector<std::pair<const Normalized
   for (auto output_index = size_t{0}; output_index < row_count; ++output_index) {
     const auto winner = tree[0];
     DebugAssert(heads[winner] != ends[winner], "Winning run must not be exhausted while rows are left to merge.");
-    *output++ = heads[winner]->row_id;
+    if constexpr (std::is_same_v<OutputType, RowID>) {
+      *output++ = heads[winner]->row_id;
+    } else {
+      *output++ = *heads[winner];
+    }
     ++heads[winner];
 
     auto candidate = winner;
@@ -602,9 +614,111 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   return boundaries;
 }
 
+// Maximum fan-in of a single k-way merge, i.e. the cap on how many runs one loser tree may merge at once. This is the
+// knob; the number of levels follows from it and from the run count, rather than the other way round. With a cap of c
+// and R runs, a partition performs ceil(R / c) merges of at most c runs each, then repeats on the results until at most
+// c runs are left, which the final level merges straight into the position list. For R = 192 and c = 32 that is six
+// 32-way merges followed by one 6-way merge.
+//
+// A cap of 0 or one at least as large as the run count is the plain single-level merge over every run, so the previous
+// behaviour is just the top of this knob's range.
+//
+// This is the single place to make the cap adaptive: return a function of the run count (e.g. ceil(sqrt(run_count)),
+// which always yields exactly two levels), the partition's row count, or the machine instead of a constant.
+size_t determine_merge_fan_in(const size_t /*run_count*/, const size_t /*row_count*/) {
+  constexpr auto MAX_MERGE_FAN_IN = size_t{32};
+  return MAX_MERGE_FAN_IN;
+}
+
+// How many intermediate levels a partition of `run_count` runs needs under `fan_in`, i.e. how many levels write to
+// scratch before the final level writes RowIDs. Zero means the single-level merge.
+size_t merge_intermediate_level_count(const size_t run_count, const size_t fan_in) {
+  if (fan_in < 2) {
+    return 0;  // an unusable cap collapses to the single-level merge
+  }
+
+  auto level_count = size_t{0};
+  auto live_count = run_count;
+  while (live_count > fan_in) {
+    live_count = div_ceil(live_count, fan_in);
+    ++level_count;
+  }
+  return level_count;
+}
+
+// Merge one output partition as a cascade of k-way merges, each with at most `fan_in` runs. `live` are the
+// partition's (already pruned) runs, in run order.
+//
+// While more than `fan_in` runs are left, the level splits them into ceil(live / fan_in) contiguous, balanced groups
+// and merges each group with its own loser tree into a scratch buffer; the merged groups become the runs of the next
+// level. The last level merges what is left straight into `output` as RowIDs, so the extraction stays fused. The
+// number of levels therefore follows from the run count: it is one as long as a partition has at most `fan_in` runs.
+//
+// Groups are contiguous ranges of the run order and every tree breaks ties by lowest index, so a row that came from an
+// earlier run still precedes an equal row from a later run after any number of levels: the nested merge is as stable
+// as the single-level one.
+//
+// `buffers` holds up to two scratch ranges, each at least `row_count` long and private to this partition. Two are
+// enough at any number of levels: a level reads the buffer the previous level wrote and writes the other one, whose
+// contents were already consumed. A null buffer (or a cap that no level can use) collapses this to a single merge.
+void merge_partition_nested(std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>> live,
+                            const size_t key_size, const size_t row_count, RowID* output,
+                            const std::array<NormalizedKeyRow*, 2>& buffers, const size_t fan_in) {
+  auto buffer_index = size_t{0};
+
+  while (fan_in >= 2 && live.size() > fan_in) {
+    const auto live_count = live.size();
+    const auto group_count = div_ceil(live_count, fan_in);
+    DebugAssert(group_count > 1, "More than fan_in runs must split into more than one group.");
+
+    auto* destination = buffers[buffer_index];
+    if (destination == nullptr) {
+      break;  // no scratch for this level: fall back to merging everything that is left in one go
+    }
+
+    auto next = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
+    next.reserve(group_count);
+
+    auto written = size_t{0};
+    for (auto group = size_t{0}; group < group_count; ++group) {
+      const auto first_run = live_count * group / group_count;
+      const auto last_run = live_count * (group + 1) / group_count;
+      DebugAssert(first_run < last_run, "Balanced grouping must not produce an empty group.");
+      DebugAssert(last_run - first_run <= fan_in, "A group must not exceed the fan-in cap.");
+
+      auto group_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(
+          live.begin() + static_cast<std::ptrdiff_t>(first_run),
+          live.begin() + static_cast<std::ptrdiff_t>(last_run));
+
+      auto group_row_count = size_t{0};
+      for (const auto& run : group_runs) {
+        group_row_count += static_cast<size_t>(run.second - run.first);
+      }
+
+      auto* group_output = destination + written;
+      merge_partition_of_sorted_runs(group_runs, key_size, group_row_count, group_output);
+      next.emplace_back(group_output, group_output + group_row_count);
+      written += group_row_count;
+    }
+    DebugAssert(written == row_count, "A level must move every row of the partition.");
+
+    live = std::move(next);
+    buffer_index ^= 1;
+  }
+
+  merge_partition_of_sorted_runs(live, key_size, row_count, output);
+}
+
 // Parallel k-way merge: merge each output partition delimited by `boundaries` independently, writing RowIDs straight
-// into that partition's slice of the position list (reusing merge_partition_of_sorted_runs). Single pass over the
-// data. The boundaries are precomputed by compute_merge_path_boundaries so that the merge path is its own phase.
+// into that partition's slice of the position list. The boundaries are precomputed by compute_merge_path_boundaries so
+// that the merge path is its own phase.
+//
+// Within a partition the merge is a cascade of k-way merges capped at determine_merge_fan_in() runs each (see
+// merge_partition_nested). How many levels that takes follows from the run count, so a run count at or below the cap
+// costs exactly one level and touches the data once, as before. Each intermediate level needs scratch, ping-ponged
+// between at most two buffers, each as long as the whole output because a partition's buffer slice is exactly its own
+// output range. TODO: `sort_scratch` in _on_execute is already a row-count-sized NormalizedKeyRow buffer and is dead by
+// this point -- passing it in would save one of these allocations.
 RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
                               const size_t key_size, const size_t row_count,
                               const std::vector<std::vector<size_t>>& boundaries) {
@@ -616,6 +730,14 @@ RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow
   const auto run_count = runs.size();
   DebugAssert(boundaries.size() >= 2, "Expected at least one partition for a non-empty input.");
   const auto partitions_count = boundaries.size() - 1;
+
+  const auto merge_fan_in = determine_merge_fan_in(run_count, row_count);
+  // A partition holds at most `run_count` runs, so the level count for the whole run list bounds every partition's.
+  const auto buffer_count = std::min(merge_intermediate_level_count(run_count, merge_fan_in), size_t{2});
+  auto level_buffers = std::vector<uninitialized_vector<NormalizedKeyRow>>(buffer_count);
+  for (auto& buffer : level_buffers) {
+    buffer = uninitialized_vector<NormalizedKeyRow>(row_count);
+  }
 
   // Merge each partition independently and in parallel, writing RowIDs straight into its slice of position_list.
   auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
@@ -635,7 +757,14 @@ RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow
         }
       }
       if (!sub_runs.empty()) {
-        merge_partition_of_sorted_runs(sub_runs, key_size, out_end - out_begin, position_list.data() + out_begin);
+        // Each partition owns the [out_begin, out_end) slice of every level buffer, which is exactly as long as the
+        // rows it emits, so the levels never touch another partition's scratch.
+        auto partition_buffers = std::array<NormalizedKeyRow*, 2>{nullptr, nullptr};
+        for (auto buffer_index = size_t{0}; buffer_index < buffer_count; ++buffer_index) {
+          partition_buffers[buffer_index] = level_buffers[buffer_index].data() + out_begin;
+        }
+        merge_partition_nested(std::move(sub_runs), key_size, out_end - out_begin,
+                               position_list.data() + out_begin, partition_buffers, merge_fan_in);
       }
     }));
   }
