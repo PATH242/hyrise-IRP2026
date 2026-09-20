@@ -345,8 +345,9 @@ std::shared_ptr<AbstractOperator> LQPTranslator::_translate_sort_node(
 
     column_definitions.emplace_back(pqp_column_expression->column_id, *sort_mode_iter);
   }
-  current_pqp = std::make_shared<Sort>(current_pqp, column_definitions);
-
+  // PS: THIS IS ONLY FOR BENCHMARKING E2E SORTING. DO NOT USE THIS IN PRODUCTION CODE.
+  current_pqp = std::make_shared<Sort>(current_pqp, column_definitions, Chunk::DEFAULT_SIZE,
+                                      Sort::ForceMaterialization::Yes);
   return current_pqp;
 }
 
