@@ -32,6 +32,7 @@
 #include "resolve_type.hpp"
 #include "scheduler/abstract_task.hpp"
 #include "scheduler/job_task.hpp"
+#include "scheduler/node_queue_scheduler.hpp"
 #include "scheduler/operator_task.hpp"
 #include "storage/abstract_segment.hpp"
 #include "storage/base_segment_accessor.hpp"
@@ -45,7 +46,6 @@
 #include "types.hpp"
 #include "utils/assert.hpp"
 #include "utils/timer.hpp"
-#include "scheduler/node_queue_scheduler.hpp" 
 
 namespace {
 
@@ -507,102 +507,68 @@ void merge_partition_of_sorted_runs(const std::vector<std::pair<const Normalized
   }
 }
 
-// Sequential K-way Merge Path: find how many elements of each run fall in the first `target` merged outputs,
-// i.e. the flat frontier. Lower-run-index breaks ties, matching merge_partition_of_sorted_runs. NOTE: the peek is offset+step-1
+// K-way Merge Path: find how many elements of each run fall in the first `advance_by` merged outputs, i.e. the flat
+// frontier. Lower-run-index breaks ties, matching merge_partition_of_sorted_runs. NOTE: the peek is offset+step-1
 // (last element TAKEN), not the blog's offset+delta -- the latter is off-by-one on the flat-frontier condition.
-// `start_offsets` is a valid frontier (its elements sum to some C); this advances it by `advance_by` more output
-// elements and returns the frontier for C + advance_by. Seeding each boundary from the previous one makes the P-1
-// partition_boundaries cost O(N) work overall instead of O(P*N), at the cost of computing them sequentially.
+//
+// Every boundary is computed independently from zero, so the P-1 internal boundaries are mutually independent and can
+// be computed in parallel, one task each (DuckDB k-way merge-path design). This costs more total work than seeding
+// each frontier from the previous one (which is O(N) overall but strictly sequential), and that is the trade: the
+// merge path is no longer an Amdahl term that grows with the partition count.
 std::vector<size_t> compute_intersections(
     const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& sorted_runs, const size_t key_size,
-    std::vector<size_t> intersections, size_t advance_by) {
+    size_t advance_by) {
   const auto run_count = sorted_runs.size();
+  auto intersections = std::vector<size_t>(run_count, 0);
 
   while (advance_by != 0) {
     const auto delta = div_ceil(advance_by, run_count);
 
-    auto min_idx = run_count;
+    auto min_idx = run_count;  // "unset" sentinel so exhausted runs can be skipped
     const NormalizedKeyRow* min_val = nullptr;
-    for (size_t run_idx = 0; run_idx < run_count; ++run_idx) {
+    for (auto run_idx = size_t{0}; run_idx < run_count; ++run_idx) {
       const auto length = static_cast<size_t>(sorted_runs[run_idx].second - sorted_runs[run_idx].first);
       if (intersections[run_idx] >= length) {
-        continue;                                      // exhausted run
+        continue;  // exhausted run is not eligible
       }
       const auto step = std::min(delta, length - intersections[run_idx]);
       // peek at the LAST element this advance takes (offset+step-1)
       const auto* val = sorted_runs[run_idx].first + intersections[run_idx] + step - 1;
+      // Ascending scan keeps the lowest index on ties, so only a strictly smaller key replaces the best.
       if (min_idx == run_count || val->less_than(*min_val, key_size)) {
         min_idx = run_idx;
         min_val = val;
       }
     }
 
-    const auto step = std::min(delta, static_cast<size_t>(sorted_runs[min_idx].second - sorted_runs[min_idx].first)
-                                          - intersections[min_idx]);
+    const auto step = std::min(delta, static_cast<size_t>(sorted_runs[min_idx].second - sorted_runs[min_idx].first) -
+                                          intersections[min_idx]);
     intersections[min_idx] += step;
     advance_by -= step;
   }
   return intersections;
 }
 
-// Compute the frontier for the first `advance_by` merged outputs: how many elements of each run precede it.
-// Each boundary is computed independently from zero, so the P-1 boundaries can be found in parallel (DuckDB k-way
-// merge-path design).
-// std::vector<size_t> compute_intersections_parallel(
-//     const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& sorted_runs, const size_t key_size,
-//     size_t advance_by) {
-//   const auto run_count = sorted_runs.size();
-//   auto intersections = std::vector<size_t>(run_count, 0);
-
-//   while (advance_by != 0) {
-//     const auto delta = div_ceil(advance_by, run_count);
-
-//     auto min_idx = run_count;  // "unset" sentinel so exhausted runs can be skipped
-//     const NormalizedKeyRow* min_val = nullptr;
-//     for (auto run_idx = size_t{0}; run_idx < run_count; ++run_idx) {
-//       const auto length = static_cast<size_t>(sorted_runs[run_idx].second - sorted_runs[run_idx].first);
-//       if (intersections[run_idx] >= length) {
-//         continue;  // exhausted run is not eligible
-//       }
-//       const auto step = std::min(delta, length - intersections[run_idx]);
-//       const auto* val = sorted_runs[run_idx].first + intersections[run_idx] + step - 1;
-//       // Ascending scan keeps the lowest index on ties, so only a strictly smaller key replaces the best.
-//       if (min_idx == run_count || val->less_than(*min_val, key_size)) {
-//         min_idx = run_idx;
-//         min_val = val;
-//       }
-//     }
-
-//     const auto step =
-//         std::min(delta, static_cast<size_t>(sorted_runs[min_idx].second - sorted_runs[min_idx].first) -
-//                             intersections[min_idx]);
-//     intersections[min_idx] += step;
-//     advance_by -= step;
-//   }
-//   return intersections;
-// }
-
-// Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine
-// instead of the input size (the previous fixed partition size made the partition count a function of the row count,
-// which left workers idle on small inputs and produced a ragged final wave on medium ones). Falls back to a single
-// partition when no worker-based scheduler is set (active_worker_count() == 0 under the ImmediateExecutionScheduler),
-// which keeps the merge correct and serial. Never exceeds row_count, so every partition emits at least one row.
+// Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine instead
+// of the input size (a fixed partition size makes the partition count a function of the row count, which leaves
+// workers idle on small inputs and produces a ragged final wave on medium ones). Falls back to a single partition when
+// no worker-based scheduler is set, which keeps the merge correct and serial. Never exceeds row_count, so every
+// partition emits at least one row.
 size_t determine_merge_partition_count(const size_t row_count) {
   auto worker_count = size_t{1};
-  const auto& scheduler = Hyrise::get().scheduler();
-  if (const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(scheduler)) {
+  if (const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(Hyrise::get().scheduler())) {
     worker_count = static_cast<size_t>(node_queue_scheduler->active_worker_count());
   }
   return std::clamp(worker_count, size_t{1}, row_count);
 }
 
 // Merge path for the k-way merge: compute the partition boundaries only, so that this phase can be timed separately
-// from the merge itself (OperatorSteps::MergePath vs. OperatorSteps::MergeSortedRuns).
+// from the merge itself (OperatorSteps::MergePath vs. the merge step).
 //
 // boundaries[p][run] = elements of `run` consumed by output position row_count * p / partition_count. Two consecutive
-// boundaries bound one output partition. The first and last boundary are known without any comparisons; the internal
-// ones are computed sequentially, each seeded from the previous frontier, which costs O(N) in total instead of the
-// O(P*N) of computing every boundary independently from zero (see compute_intersections_parallel above).
+// boundaries bound one output partition. The first and last boundary are known without any comparisons; each internal
+// one is computed from zero in its own task, so the whole phase runs at the parallelism of the scheduler. The tasks
+// write to distinct elements of an already-sized vector, so no synchronization is needed.
 std::vector<std::vector<size_t>> compute_merge_path_boundaries(
     const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
     const size_t row_count, const size_t partition_count) {
@@ -620,10 +586,18 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
     boundaries.back()[run] = static_cast<size_t>(runs[run].second - runs[run].first);
   }
 
-  for (auto partition = size_t{1}; partition < partition_count; ++partition) {
-    const auto advance_by = row_count * partition / partition_count - row_count * (partition - 1) / partition_count;
-    boundaries[partition] = compute_intersections(runs, key_size, boundaries[partition - 1], advance_by);
+  if (partition_count == 1) {
+    return boundaries;  // a single partition needs no internal boundary
   }
+
+  auto boundary_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+  boundary_tasks.reserve(partition_count - 1);
+  for (auto partition = size_t{1}; partition < partition_count; ++partition) {
+    boundary_tasks.emplace_back(std::make_shared<JobTask>([&, partition]() {
+      boundaries[partition] = compute_intersections(runs, key_size, row_count * partition / partition_count);
+    }));
+  }
+  Hyrise::get().scheduler()->schedule_and_wait_for_tasks(boundary_tasks);
 
   return boundaries;
 }
