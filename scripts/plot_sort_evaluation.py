@@ -3,17 +3,20 @@
 
     python3 plot_results.py --csv results/all_results.csv --outdir figures/
 
-Produces, for every (scale factor, encoding) cell present in the data:
+Produces, for every scale factor present in the data:
 
     fig1_payload_sweep      runtime vs payload width, one line per routine    [the headline figure]
     fig2_phase_breakdown    stacked phase composition per routine
     fig3_speedup            speedup over the baseline routine
-    fig4_encoding_control   Dictionary vs Unencoded, same axes               [if both present]
     fig5_operator_vs_sql    does the operator-level win survive a real plan  [if sql rows present]
     summary.csv / summary.md   median, spread and speedup per configuration  [the table view]
 
-Phase columns are discovered from the CSV header (every `*_US` column except TOTAL_US), so adding
-MERGE_PATH_US on the C++ side needs no change here.
+Phases are self-adapting. Columns are discovered from the CSV header (every `*_US` except TOTAL_US),
+so adding MERGE_PATH_US on the C++ side needs no change here; a phase that no run in the data
+reports is dropped rather than drawn as an empty legend entry, and a missing value for one run is
+treated as absent rather than breaking the stack.
+
+Encoding is not an axis and is ignored even if the column is present.
 
 Requires: pandas, matplotlib.
 """
@@ -120,18 +123,30 @@ def phase_label(column: str) -> str:
 def load(csv_path: Path, routine_order: list[str] | None) -> tuple[pd.DataFrame, list[str]]:
     frame = pd.read_csv(csv_path)
 
-    required = {"ROUTINE", "HARNESS", "SCALE", "ENCODING", "PAYLOAD_COLS", "RUN_ID", "TOTAL_US"}
+    required = {"ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS", "RUN_ID", "TOTAL_US"}
     missing = required - set(frame.columns)
     if missing:
         sys.exit(f"{csv_path}: missing columns {sorted(missing)}")
 
-    phases = phase_columns(frame)
-    if not phases:
-        print("  note: no phase columns found; skipping the phase breakdown figure", file=sys.stderr)
-
     frame["TOTAL_MS"] = frame["TOTAL_US"] / 1000.0
-    for column in phases:
-        frame[column[:-3] + "_MS"] = frame[column] / 1000.0
+
+    # Flexible phases: keep only the ones some run in this data actually reports. A column that is absent,
+    # all-NaN or all-zero belongs to a phase no routine here has -- drop it instead of drawing an empty
+    # legend entry. Missing values within a kept column become 0 so one gap cannot break a stack.
+    phases, dropped = [], []
+    for column in phase_columns(frame):
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.fillna(0).abs().sum() > 0:
+            frame[column] = values.fillna(0)
+            frame[column[:-3] + "_MS"] = frame[column] / 1000.0
+            phases.append(column)
+        else:
+            dropped.append(column)
+
+    if dropped:
+        print(f"  note: no run reports {', '.join(phase_label(c) for c in dropped)}; dropped from the figures")
+    if not phases:
+        print("  note: no phase columns with data; skipping the phase breakdown figure", file=sys.stderr)
 
     if routine_order:
         known = [r for r in routine_order if r in set(frame["ROUTINE"])]
@@ -158,7 +173,7 @@ def color_for(routine: str, order: list[str]) -> str:
 def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> None:
     print("data checks")
 
-    runs = frame.groupby(["ROUTINE", "HARNESS", "SCALE", "ENCODING", "PAYLOAD_COLS"], observed=True)["TOTAL_MS"]
+    runs = frame.groupby(["ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS"], observed=True)["TOTAL_MS"]
     stats = runs.agg(["count", "mean", "std", "median"]).reset_index()
     stats["cv_pct"] = 100 * stats["std"] / stats["mean"]
 
@@ -172,7 +187,7 @@ def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> N
     else:
         print(f"  ! {len(noisy)} configuration(s) above {cv_threshold:.0f}% CV -- check the machine was quiet:")
         for _, row in noisy.head(8).iterrows():
-            print(f"      {row['ROUTINE']:<10} {row['HARNESS']:<9} sf={row['SCALE']:<5} {row['ENCODING']:<11}"
+            print(f"      {row['ROUTINE']:<10} {row['HARNESS']:<9} sf={row['SCALE']:<5}"
                   f" payload={row['PAYLOAD_COLS']:<3} CV={row['cv_pct']:.1f}%")
 
     if "MATERIALIZED" in frame.columns:
@@ -183,6 +198,13 @@ def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> N
             print("    was not in effect there; those rows are NOT comparable to the blog and WRITE_OUT_US is ~0")
 
     if phases:
+        print(f"  ok  phases in use: {', '.join(phase_label(c) for c in phases)}")
+        for column in phases:
+            silent = sorted({str(r) for r in frame[frame[column] == 0]["ROUTINE"]}
+                            - {str(r) for r in frame[frame[column] > 0]["ROUTINE"]})
+            if silent:
+                print(f"        {phase_label(column)}: 0 for {silent}")
+
         phase_ms = [c[:-3] + "_MS" for c in phases]
         residual = frame["TOTAL_MS"] - frame[phase_ms].sum(axis=1)
         share = (residual / frame["TOTAL_MS"]).median()
@@ -195,7 +217,7 @@ def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> N
 # =====================================================================================================================
 # Aggregation
 # =====================================================================================================================
-GROUP = ["ROUTINE", "HARNESS", "SCALE", "ENCODING", "PAYLOAD_COLS"]
+GROUP = ["ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS"]
 
 
 def summarize(frame: pd.DataFrame, phases: list[str], baseline: str) -> pd.DataFrame:
@@ -221,7 +243,7 @@ def summarize(frame: pd.DataFrame, phases: list[str], baseline: str) -> pd.DataF
     if "rows" in table.columns:
         table["ns_per_tuple"] = (1e6 * table["median_ms"] / table["rows"]).round(1)
 
-    key = ["HARNESS", "SCALE", "ENCODING", "PAYLOAD_COLS"]
+    key = ["HARNESS", "SCALE", "PAYLOAD_COLS"]
     base = table[table["ROUTINE"] == baseline].set_index(key)["median_ms"]
     table["speedup_vs_base"] = table.apply(
         lambda row: round(base.get(tuple(row[k] for k in key), float("nan")) / row["median_ms"], 3)
@@ -243,15 +265,6 @@ def figure_legend(fig, axis, ncol: int | None = None, y: float = 1.0) -> None:
                ncol=ncol or len(labels), handlelength=1.4, columnspacing=1.6)
 
 
-def share_y_by_scale(axes, panels) -> None:
-    """Panels at the same scale factor get one y-scale, so they are visually comparable; different SFs do not."""
-    tops: dict[float, float] = {}
-    for axis, (scale, _) in zip(axes, panels):
-        tops[scale] = max(tops.get(scale, 0.0), axis.get_ylim()[1])
-    for axis, (scale, _) in zip(axes, panels):
-        axis.set_ylim(0, tops[scale])
-
-
 def plural_cols(width: int) -> str:
     return f"{width} col" if width == 1 else f"{width} cols"
 
@@ -264,10 +277,9 @@ def save(fig, outdir: Path, name: str, formats: list[str]) -> None:
     plt.close(fig)
 
 
-def cells(frame: pd.DataFrame) -> list[tuple]:
-    """(scale, encoding) pairs present in the operator data, in a stable order."""
-    operator = frame[frame["HARNESS"] == "operator"]
-    return sorted({(row.SCALE, row.ENCODING) for row in operator.itertuples()})
+def scales(frame: pd.DataFrame) -> list[float]:
+    """Scale factors present in the operator data, ascending."""
+    return sorted(set(frame[frame["HARNESS"] == "operator"]["SCALE"]))
 
 
 # =====================================================================================================================
@@ -277,12 +289,12 @@ def fig_payload_sweep(frame, order, outdir, formats):
     data = frame[frame["HARNESS"] == "operator"]
     if data.empty:
         return
-    panels = cells(frame)
+    panels = scales(frame)
     fig, axes = plt.subplots(1, len(panels), figsize=(3.2 * len(panels), 2.7), squeeze=False)
 
-    for axis, (scale, encoding) in zip(axes[0], panels):
+    for axis, scale in zip(axes[0], panels):
         clean_axes(axis)
-        panel = data[(data["SCALE"] == scale) & (data["ENCODING"] == encoding)]
+        panel = data[data["SCALE"] == scale]
         for routine in order:
             series = panel[panel["ROUTINE"] == routine]
             if series.empty:
@@ -296,13 +308,12 @@ def fig_payload_sweep(frame, order, outdir, formats):
             axis.fill_between(widths, lows, highs, color=colour, alpha=0.13, linewidth=0)
             axis.plot(widths, medians, color=colour, linewidth=2, marker="o", markersize=4.5,
                       markeredgecolor=SURFACE, markeredgewidth=1.2, label=routine, zorder=3)
-        axis.set_title(f"SF {scale:g} · {encoding}", color=INK, pad=6)
+        axis.set_title(f"SF {scale:g}", color=INK, pad=6)
         axis.set_xlabel("payload columns")
         axis.set_xticks(sorted(set(data["PAYLOAD_COLS"])))
         axis.set_ylim(bottom=0)
 
     axes[0][0].set_ylabel("sort time (ms, median)")
-    share_y_by_scale(axes[0], panels)
     figure_legend(fig, axes[0][0], y=1.06)
     fig.suptitle("Sort runtime vs. payload width — lineitem ORDER BY l_shipdate",
                  y=1.17, fontsize=9, color=INK, ha="center")
@@ -320,13 +331,13 @@ def fig_phase_breakdown(frame, phases, order, outdir, formats, hatch):
         return
 
     widths = sorted(set(data["PAYLOAD_COLS"]))
-    panels = cells(frame)
+    panels = scales(frame)
     fig, axes = plt.subplots(1, len(panels), figsize=(3.4 * len(panels), 2.9), squeeze=False)
     phase_ms = [c[:-3] + "_MS" for c in phases]
 
-    for axis, (scale, encoding) in zip(axes[0], panels):
+    for axis, scale in zip(axes[0], panels):
         clean_axes(axis)
-        panel = data[(data["SCALE"] == scale) & (data["ENCODING"] == encoding)]
+        panel = data[data["SCALE"] == scale]
 
         positions, labels, group_centres = [], [], []
         position = 0.0
@@ -339,6 +350,7 @@ def fig_phase_breakdown(frame, phases, order, outdir, formats, hatch):
                 bottom = 0.0
                 for index, column in enumerate(phase_ms):
                     value = series[column].median()
+                    value = 0.0 if pd.isna(value) else value
                     axis.bar(position, value, bottom=bottom, width=0.78,
                              color=PHASE_COLORS[index % len(PHASE_COLORS)],
                              edgecolor=SURFACE, linewidth=1.2,  # 2px-equivalent surface gap, not a border
@@ -360,11 +372,10 @@ def fig_phase_breakdown(frame, phases, order, outdir, formats, hatch):
         for centre, width in zip(group_centres, widths):
             axis.annotate(plural_cols(width), xy=(centre, -0.28), xycoords=("data", "axes fraction"),
                           ha="center", va="top", fontsize=7, color=INK_MUTED, annotation_clip=False)
-        axis.set_title(f"SF {scale:g} · {encoding}", color=INK, pad=6)
+        axis.set_title(f"SF {scale:g}", color=INK, pad=6)
         axis.set_ylim(bottom=0)
 
     axes[0][0].set_ylabel("median time (ms)")
-    share_y_by_scale(axes[0], panels)
     figure_legend(fig, axes[0][0], y=1.14)
     fig.suptitle("Where the time goes", y=1.24, fontsize=9, color=INK)
     save(fig, outdir, "fig2_phase_breakdown", formats)
@@ -380,13 +391,13 @@ def fig_speedup(frame, order, outdir, formats, baseline):
         return
 
     widths = sorted(set(data["PAYLOAD_COLS"]))
-    panels = cells(frame)
+    panels = scales(frame)
     fig, axes = plt.subplots(1, len(panels), figsize=(3.2 * len(panels), 2.6), squeeze=False)
     bar_width = 0.8 / len(others)
 
-    for axis, (scale, encoding) in zip(axes[0], panels):
+    for axis, scale in zip(axes[0], panels):
         clean_axes(axis)
-        panel = data[(data["SCALE"] == scale) & (data["ENCODING"] == encoding)]
+        panel = data[data["SCALE"] == scale]
 
         for slot, routine in enumerate(others):
             heights, offsets = [], []
@@ -409,58 +420,13 @@ def fig_speedup(frame, order, outdir, formats, baseline):
         axis.set_xticks(range(len(widths)))
         axis.set_xticklabels([str(w) for w in widths])
         axis.set_xlabel("payload columns")
-        axis.set_title(f"SF {scale:g} · {encoding}", color=INK, pad=6)
+        axis.set_title(f"SF {scale:g}", color=INK, pad=6)
         axis.set_ylim(bottom=0)
 
     axes[0][0].set_ylabel(f"speedup over {baseline} (×)")
     figure_legend(fig, axes[0][0], y=1.07)
     fig.suptitle(f"Speedup over {baseline} — higher is faster", y=1.18, fontsize=9, color=INK)
     save(fig, outdir, "fig3_speedup", formats)
-
-
-# =====================================================================================================================
-# Figure 4 -- encoding control. Does the ranking survive a different input encoding?
-# =====================================================================================================================
-def fig_encoding_control(frame, order, outdir, formats):
-    data = frame[frame["HARNESS"] == "operator"]
-    encodings = sorted(set(data["ENCODING"]))
-    if len(encodings) < 2:
-        return
-
-    shared = sorted({s for s in data["SCALE"]
-                     if all(not data[(data["SCALE"] == s) & (data["ENCODING"] == e)].empty for e in encodings)})
-    if not shared:
-        return
-    scale = shared[-1]
-
-    widths = sorted(set(data[data["SCALE"] == scale]["PAYLOAD_COLS"]))
-    fig, axes = plt.subplots(1, len(encodings), figsize=(3.2 * len(encodings), 2.6), squeeze=False, sharey=True)
-    bar_width = 0.8 / max(len(order), 1)
-
-    for axis, encoding in zip(axes[0], encodings):
-        clean_axes(axis)
-        panel = data[(data["SCALE"] == scale) & (data["ENCODING"] == encoding)]
-        for slot, routine in enumerate(order):
-            heights, offsets = [], []
-            for index, width in enumerate(widths):
-                value = panel[(panel["ROUTINE"] == routine) & (panel["PAYLOAD_COLS"] == width)]["TOTAL_MS"].median()
-                if pd.isna(value):
-                    continue
-                heights.append(value)
-                offsets.append(index + (slot - (len(order) - 1) / 2) * bar_width)
-            axis.bar(offsets, heights, width=bar_width * 0.88, color=color_for(routine, order),
-                     edgecolor=SURFACE, linewidth=1.2, label=routine, zorder=3)
-        axis.set_xticks(range(len(widths)))
-        axis.set_xticklabels([str(w) for w in widths])
-        axis.set_xlabel("payload columns")
-        axis.set_title(encoding, color=INK, pad=6)
-        axis.set_ylim(bottom=0)
-
-    axes[0][0].set_ylabel("median time (ms)")
-    figure_legend(fig, axes[0][0], y=1.07)
-    fig.suptitle(f"Input encoding control (SF {scale:g}) — the ranking should not flip",
-                 y=1.18, fontsize=9, color=INK)
-    save(fig, outdir, "fig4_encoding_control", formats)
 
 
 # =====================================================================================================================
@@ -512,7 +478,7 @@ def write_tables(table: pd.DataFrame, outdir: Path) -> None:
     table.to_csv(csv_path, index=False)
     print(f"  wrote {csv_path}")
 
-    columns = [c for c in ["ROUTINE", "HARNESS", "SCALE", "ENCODING", "PAYLOAD_COLS", "n",
+    columns = [c for c in ["ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS", "n",
                            "median_ms", "min_ms", "max_ms", "cv_pct", "ns_per_tuple", "speedup_vs_base"]
                if c in table.columns]
     md_path = outdir / "summary.md"
@@ -560,7 +526,6 @@ def main() -> int:
     fig_payload_sweep(frame, order, args.outdir, formats)
     fig_phase_breakdown(frame, phases, order, args.outdir, formats, args.hatch)
     fig_speedup(frame, order, args.outdir, formats, args.baseline)
-    fig_encoding_control(frame, order, args.outdir, formats)
     fig_operator_vs_sql(frame, order, args.outdir, formats, args.baseline)
 
     print("\ntables")
