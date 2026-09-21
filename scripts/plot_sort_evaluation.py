@@ -9,12 +9,17 @@ Produces, for every scale factor present in the data:
     fig2_phase_breakdown    stacked phase composition per routine
     fig3_speedup            speedup over the baseline routine
     fig5_operator_vs_sql    does the operator-level win survive a real plan  [if sql rows present]
+    fig6_key_sets           phase composition per sort key set                [if >1 key set present]
     summary.csv / summary.md   median, spread and speedup per configuration  [the table view]
 
 Phases are self-adapting. Columns are discovered from the CSV header (every `*_US` except TOTAL_US),
 so adding MERGE_PATH_US on the C++ side needs no change here; a phase that no run in the data
 reports is dropped rather than drawn as an empty legend entry, and a missing value for one run is
 treated as absent rather than breaking the stack.
+
+Key sets (KEY_SET) are a facet. The payload sweep belongs to whichever key set actually has several payload
+widths -- figures 1, 2, 3 and 5 use that one; figure 6 compares key sets at full payload. Rows with no KEY_SET
+column (runs from before key sets existed) are treated as 'shipdate'.
 
 Encoding is not an axis and is ignored even if the column is present.
 
@@ -128,6 +133,11 @@ def load(csv_path: Path, routine_order: list[str] | None) -> tuple[pd.DataFrame,
     if missing:
         sys.exit(f"{csv_path}: missing columns {sorted(missing)}")
 
+    # Rows predating key sets were all sorted by l_shipdate.
+    if "KEY_SET" not in frame.columns:
+        frame["KEY_SET"] = "shipdate"
+    frame["KEY_SET"] = frame["KEY_SET"].fillna("shipdate")
+
     frame["TOTAL_MS"] = frame["TOTAL_US"] / 1000.0
 
     # Flexible phases: keep only the ones some run in this data actually reports. A column that is absent,
@@ -173,7 +183,7 @@ def color_for(routine: str, order: list[str]) -> str:
 def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> None:
     print("data checks")
 
-    runs = frame.groupby(["ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS"], observed=True)["TOTAL_MS"]
+    runs = frame.groupby(["ROUTINE", "HARNESS", "KEY_SET", "SCALE", "PAYLOAD_COLS"], observed=True)["TOTAL_MS"]
     stats = runs.agg(["count", "mean", "std", "median"]).reset_index()
     stats["cv_pct"] = 100 * stats["std"] / stats["mean"]
 
@@ -187,7 +197,7 @@ def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> N
     else:
         print(f"  ! {len(noisy)} configuration(s) above {cv_threshold:.0f}% CV -- check the machine was quiet:")
         for _, row in noisy.head(8).iterrows():
-            print(f"      {row['ROUTINE']:<10} {row['HARNESS']:<9} sf={row['SCALE']:<5}"
+            print(f"      {row['ROUTINE']:<10} {row['HARNESS']:<9} {row['KEY_SET']:<9} sf={row['SCALE']:<5}"
                   f" payload={row['PAYLOAD_COLS']:<3} CV={row['cv_pct']:.1f}%")
 
     if "MATERIALIZED" in frame.columns:
@@ -217,7 +227,7 @@ def check_data(frame: pd.DataFrame, phases: list[str], cv_threshold: float) -> N
 # =====================================================================================================================
 # Aggregation
 # =====================================================================================================================
-GROUP = ["ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS"]
+GROUP = ["ROUTINE", "HARNESS", "KEY_SET", "SCALE", "PAYLOAD_COLS"]
 
 
 def summarize(frame: pd.DataFrame, phases: list[str], baseline: str) -> pd.DataFrame:
@@ -243,7 +253,7 @@ def summarize(frame: pd.DataFrame, phases: list[str], baseline: str) -> pd.DataF
     if "rows" in table.columns:
         table["ns_per_tuple"] = (1e6 * table["median_ms"] / table["rows"]).round(1)
 
-    key = ["HARNESS", "SCALE", "PAYLOAD_COLS"]
+    key = ["HARNESS", "KEY_SET", "SCALE", "PAYLOAD_COLS"]
     base = table[table["ROUTINE"] == baseline].set_index(key)["median_ms"]
     table["speedup_vs_base"] = table.apply(
         lambda row: round(base.get(tuple(row[k] for k in key), float("nan")) / row["median_ms"], 3)
@@ -282,11 +292,23 @@ def scales(frame: pd.DataFrame) -> list[float]:
     return sorted(set(frame[frame["HARNESS"] == "operator"]["SCALE"]))
 
 
+def sweep_key_set(frame: pd.DataFrame) -> str:
+    """The key set the payload sweep belongs to: whichever has the most payload widths, 'shipdate' breaking ties."""
+    operator = frame[frame["HARNESS"] == "operator"]
+    widths = operator.groupby("KEY_SET", observed=True)["PAYLOAD_COLS"].nunique()
+    if widths.empty:
+        return "shipdate"
+    best = widths.max()
+    candidates = sorted(widths[widths == best].index)
+    return "shipdate" if "shipdate" in candidates else candidates[0]
+
+
 # =====================================================================================================================
 # Figure 1 -- runtime vs payload width. The headline: the blog's single wide-table point, as a curve.
 # =====================================================================================================================
 def fig_payload_sweep(frame, order, outdir, formats):
-    data = frame[frame["HARNESS"] == "operator"]
+    key = sweep_key_set(frame)
+    data = frame[(frame["HARNESS"] == "operator") & (frame["KEY_SET"] == key)]
     if data.empty:
         return
     panels = scales(frame)
@@ -315,7 +337,7 @@ def fig_payload_sweep(frame, order, outdir, formats):
 
     axes[0][0].set_ylabel("sort time (ms, median)")
     figure_legend(fig, axes[0][0], y=1.06)
-    fig.suptitle("Sort runtime vs. payload width — lineitem ORDER BY l_shipdate",
+    fig.suptitle(f"Sort runtime vs. payload width — lineitem, {key} key",
                  y=1.17, fontsize=9, color=INK, ha="center")
     save(fig, outdir, "fig1_payload_sweep", formats)
 
@@ -326,7 +348,8 @@ def fig_payload_sweep(frame, order, outdir, formats):
 def fig_phase_breakdown(frame, phases, order, outdir, formats, hatch):
     if not phases:
         return
-    data = frame[frame["HARNESS"] == "operator"]
+    key = sweep_key_set(frame)
+    data = frame[(frame["HARNESS"] == "operator") & (frame["KEY_SET"] == key)]
     if data.empty:
         return
 
@@ -377,7 +400,7 @@ def fig_phase_breakdown(frame, phases, order, outdir, formats, hatch):
 
     axes[0][0].set_ylabel("median time (ms)")
     figure_legend(fig, axes[0][0], y=1.14)
-    fig.suptitle("Where the time goes", y=1.24, fontsize=9, color=INK)
+    fig.suptitle(f"Where the time goes — {key} key", y=1.24, fontsize=9, color=INK)
     save(fig, outdir, "fig2_phase_breakdown", formats)
 
 
@@ -385,7 +408,8 @@ def fig_phase_breakdown(frame, phases, order, outdir, formats, hatch):
 # Figure 3 -- speedup over baseline. Mirrors the blog's speedup tables.
 # =====================================================================================================================
 def fig_speedup(frame, order, outdir, formats, baseline):
-    data = frame[frame["HARNESS"] == "operator"]
+    key = sweep_key_set(frame)
+    data = frame[(frame["HARNESS"] == "operator") & (frame["KEY_SET"] == key)]
     others = [r for r in order if r != baseline]
     if data.empty or not others:
         return
@@ -435,9 +459,12 @@ def fig_speedup(frame, order, outdir, formats, baseline):
 def fig_operator_vs_sql(frame, order, outdir, formats, baseline):
     if "sql" not in set(frame["HARNESS"]):
         return
-    sql = frame[frame["HARNESS"] == "sql"]
-    widest = frame[frame["HARNESS"] == "operator"]["PAYLOAD_COLS"].max()
-    operator = frame[(frame["HARNESS"] == "operator") & (frame["PAYLOAD_COLS"] == widest)]
+    key = sweep_key_set(frame)
+    sql = frame[(frame["HARNESS"] == "sql") & (frame["KEY_SET"] == key)]
+    operator = frame[(frame["HARNESS"] == "operator") & (frame["KEY_SET"] == key)]
+    if operator.empty:
+        return
+    operator = operator[operator["PAYLOAD_COLS"] == operator["PAYLOAD_COLS"].max()]
 
     scales = sorted(set(sql["SCALE"]) & set(operator["SCALE"]))
     if not scales:
@@ -468,8 +495,71 @@ def fig_operator_vs_sql(frame, order, outdir, formats, baseline):
 
     axes[0][0].set_ylabel("median time (ms)")
     figure_legend(fig, axes[0][0], y=1.07)
-    fig.suptitle("Isolated operator vs. end-to-end query", y=1.18, fontsize=9, color=INK)
+    fig.suptitle(f"Isolated operator vs. end-to-end query — {key} key", y=1.18, fontsize=9, color=INK)
     save(fig, outdir, "fig5_operator_vs_sql", formats)
+
+
+# =====================================================================================================================
+# Figure 6 -- the key-set comparison. Composite keys are where the upstream one-sort-per-column design is exposed.
+# =====================================================================================================================
+def fig_key_sets(frame, phases, order, outdir, formats, hatch, key_order):
+    data = frame[frame["HARNESS"] == "operator"]
+    keys = [k for k in key_order if k in set(data["KEY_SET"])]
+    if len(keys) < 2 or not phases:
+        return
+
+    # One experiment per key set, at that key set's widest payload -- so all key sets are compared at full row.
+    widest = data.groupby("KEY_SET", observed=True)["PAYLOAD_COLS"].transform("max")
+    data = data[data["PAYLOAD_COLS"] == widest]
+
+    panels = scales(frame)
+    fig, axes = plt.subplots(1, len(panels), figsize=(3.6 * len(panels), 3.0), squeeze=False)
+    phase_ms = [c[:-3] + "_MS" for c in phases]
+
+    for axis, scale in zip(axes[0], panels):
+        clean_axes(axis)
+        panel = data[data["SCALE"] == scale]
+
+        positions, labels, group_centres = [], [], []
+        position = 0.0
+        for key in keys:
+            start = position
+            for routine in order:
+                series = panel[(panel["ROUTINE"] == routine) & (panel["KEY_SET"] == key)]
+                if series.empty:
+                    continue
+                bottom = 0.0
+                for index, column in enumerate(phase_ms):
+                    value = series[column].median()
+                    value = 0.0 if pd.isna(value) else value
+                    axis.bar(position, value, bottom=bottom, width=0.78,
+                             color=PHASE_COLORS[index % len(PHASE_COLORS)],
+                             edgecolor=SURFACE, linewidth=1.2,
+                             hatch=PHASE_HATCHES[index % len(PHASE_HATCHES)] if hatch else None,
+                             label=phase_label(phases[index]) if not positions else None)
+                    bottom += value
+                residual = max(series["TOTAL_MS"].median() - bottom, 0.0)
+                axis.bar(position, residual, bottom=bottom, width=0.78, color=RESIDUAL_COLOR,
+                         edgecolor=SURFACE, linewidth=1.2,
+                         label="Other (operator overhead)" if not positions else None)
+                positions.append(position)
+                labels.append(routine)
+                position += 1
+            group_centres.append((start + position - 1) / 2)
+            position += 0.7
+
+        axis.set_xticks(positions)
+        axis.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        for centre, key in zip(group_centres, keys):
+            axis.annotate(key, xy=(centre, -0.34), xycoords=("data", "axes fraction"),
+                          ha="center", va="top", fontsize=7.5, color=INK, annotation_clip=False)
+        axis.set_title(f"SF {scale:g}", color=INK, pad=6)
+        axis.set_ylim(bottom=0)
+
+    axes[0][0].set_ylabel("median time (ms)")
+    figure_legend(fig, axes[0][0], y=1.14)
+    fig.suptitle("Sort key sets, full payload", y=1.24, fontsize=9, color=INK)
+    save(fig, outdir, "fig6_key_sets", formats)
 
 
 # =====================================================================================================================
@@ -478,7 +568,7 @@ def write_tables(table: pd.DataFrame, outdir: Path) -> None:
     table.to_csv(csv_path, index=False)
     print(f"  wrote {csv_path}")
 
-    columns = [c for c in ["ROUTINE", "HARNESS", "SCALE", "PAYLOAD_COLS", "n",
+    columns = [c for c in ["ROUTINE", "HARNESS", "KEY_SET", "SCALE", "PAYLOAD_COLS", "n",
                            "median_ms", "min_ms", "max_ms", "cv_pct", "ns_per_tuple", "speedup_vs_base"]
                if c in table.columns]
     md_path = outdir / "summary.md"
@@ -498,6 +588,8 @@ def main() -> int:
                         help="serif matches a Times-set paper body")
     parser.add_argument("--hatch", action="store_true",
                         help="add hatching to stacked phases so the figure survives greyscale printing")
+    parser.add_argument("--keys", default=None,
+                        help="comma-separated KEY_SET filter (default: all present)")
     parser.add_argument("--cv-threshold", type=float, default=5.0, help="warn above this coefficient of variation")
     args = parser.parse_args()
 
@@ -506,11 +598,24 @@ def main() -> int:
 
     routine_order = args.routine_order.split(",") if args.routine_order else None
     frame, phases = load(args.csv, routine_order)
+
+    key_order = args.keys.split(",") if args.keys else None
+    if key_order:
+        frame = frame[frame["KEY_SET"].isin(key_order)]
+        if frame.empty:
+            sys.exit(f"no rows with KEY_SET in {key_order}")
+    else:
+        # Stable, meaningful order: the sweep key set first, then the rest alphabetically.
+        present = sorted(set(frame["KEY_SET"]))
+        first = sweep_key_set(frame)
+        key_order = ([first] if first in present else []) + [k for k in present if k != first]
+
     order = list(frame["ROUTINE"].cat.categories)
 
     print(f"loaded {len(frame)} rows from {args.csv}")
     print(f"  routines : {', '.join(order)}")
     print(f"  phases   : {', '.join(phase_label(p) for p in phases) or '(none)'}")
+    print(f"  key sets : {', '.join(key_order)}  (payload sweep: {sweep_key_set(frame)})")
     print(f"  harnesses: {', '.join(sorted(set(frame['HARNESS'])))}\n")
 
     check_data(frame, phases, args.cv_threshold)
@@ -527,6 +632,7 @@ def main() -> int:
     fig_phase_breakdown(frame, phases, order, args.outdir, formats, args.hatch)
     fig_speedup(frame, order, args.outdir, formats, args.baseline)
     fig_operator_vs_sql(frame, order, args.outdir, formats, args.baseline)
+    fig_key_sets(frame, phases, order, args.outdir, formats, args.hatch, key_order)
 
     print("\ntables")
     write_tables(summarize(frame, phases, args.baseline), args.outdir)

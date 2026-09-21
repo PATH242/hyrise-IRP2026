@@ -48,7 +48,7 @@ using namespace hyrise;  // NOLINT(build/namespaces)
 // Two harnesses:
 //   operator  Sort driven directly (GetTable + column pruning + ForceMaterialization::Yes). This is the payload-cost
 //             measurement: the sort produces a RowIDPosList and the payload is gathered afterwards in WriteOutput.
-//   sql       `SELECT * FROM lineitem ORDER BY l_shipdate` through SQLPipeline.
+//   sql       `SELECT * FROM lineitem ORDER BY <key set>` through SQLPipeline.
 //
 // REQUIRED PATCH for the sql harness -- carry it in the evaluation commit so every routine branch gets it:
 //   src/lib/logical_query_plan/lqp_translator.cpp, _translate_sort_node(), currently:
@@ -99,23 +99,76 @@ constexpr auto PHASE_COUNT = PHASES.size();
 // Workload definition
 // ---------------------------------------------------------------------------------------------------------------
 constexpr auto TABLE_NAME = "lineitem";
-constexpr auto SORT_KEY = "l_shipdate";
-constexpr auto SQL_QUERY = "SELECT * FROM lineitem ORDER BY l_shipdate;";
 
-// Encoding is no longer an axis: BenchmarkConfig::encoding_config is left at its default, which is Hyrise's own
+// Encoding is not an axis: BenchmarkConfig::encoding_config is left at its default, which is Hyrise's own
 // "Automatic" setting (the default of hyriseBenchmarkTPCH). Note this is NOT "unencoded" -- with no preferred spec,
 // auto_select_segment_encoding_spec picks PER COLUMN: Unencoded for unique-valued columns, FrameOfReference for Int,
 // Dictionary for everything else. It is deterministic and identical across routines, so the comparison stays fair,
 // but lineitem ends up with a mix, which is worth one sentence in the paper. Recorded in the CSV for the record.
 constexpr auto ENCODING_TAG = "automatic";
 
-// lineitem's non-key columns in table order. Payload width N takes the first N of these; "all" takes every one.
-// NOTE: widths 1/4/8 are all fixed-width (int32/float); the jump to "all" also introduces the string columns, so that
-// step changes payload width AND payload type at once. Keep that in mind when reading the WRITE_OUT_US curve.
-const auto PAYLOAD_COLUMN_ORDER = std::vector<std::string>{
-    "l_orderkey",  "l_partkey",    "l_suppkey",     "l_linenumber",   "l_quantity", "l_extendedprice",
-    "l_discount",  "l_tax",        "l_returnflag",  "l_linestatus",   "l_commitdate",
-    "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment"};
+// ---------------------------------------------------------------------------------------------------------------
+// KEY SETS -- add one here and it is immediately selectable with --key; nothing else needs to change.
+//
+//   shipdate  the DuckDB blog analog: one 10-char SSO string key. This is the key set the payload sweep belongs to.
+//   ties      3 leading groups x 2 -> almost all work lands in tie-breaking. The cell where the upstream multi-pass
+//             design (one full stable_sort PER sort column) is most exposed against a single-pass composite sort.
+//   pk        lineitem's primary key: two int32 columns, unique, and generated in ascending order -- so this doubles
+//             as the pre-sorted / adaptivity probe.
+//   comment   one key, wide in BYTES rather than columns: 10-44 chars, heap-allocated, straddles the SSO boundary.
+//
+// CAVEAT for the paper: for a multi-column key the upstream baseline runs N full sorts, so its MATERIALIZE_US and
+// SORT_US are sums ACROSS PASSES, not one pass's cost -- the operator exposes only four cumulative step timers and
+// cannot separate them. The single-pass routines' bars are one pass. That asymmetry is the result, but it has to be
+// stated rather than left for the reader to assume like-for-like.
+// ---------------------------------------------------------------------------------------------------------------
+struct KeySet {
+  std::string_view name;
+  std::vector<std::string> columns;
+};
+
+const auto KEY_SETS = std::vector<KeySet>{
+    {"shipdate", {"l_shipdate"}},
+    {"ties", {"l_returnflag", "l_linestatus", "l_shipdate"}},
+    {"pk", {"l_orderkey", "l_linenumber"}},
+    {"comment", {"l_comment"}},
+};
+
+static const KeySet& key_set_by_name(const std::string& name) {
+  for (const auto& key_set : KEY_SETS) {
+    if (key_set.name == name) {
+      return key_set;
+    }
+  }
+  auto known = std::string{};
+  for (const auto& key_set : KEY_SETS) {
+    known += std::string{key_set.name} + " ";
+  }
+  Fail("Unknown --key '" + name + "'. Known key sets: " + known);
+}
+
+static std::string join(const std::vector<std::string>& parts, const std::string& separator) {
+  auto out = std::string{};
+  for (auto index = size_t{0}; index < parts.size(); ++index) {
+    out += (index ? separator : "") + parts[index];
+  }
+  return out;
+}
+
+// The payload is every lineitem column that is not part of this key set, in table order. Payload width N takes the
+// first N. Computed rather than hardcoded, because which columns are available depends on the key set -- which also
+// means width N is a DIFFERENT set of columns for different key sets: compare widths within a key set, never across.
+static std::vector<std::string> payload_column_order(const std::string& table_name,
+                                                     const std::vector<std::string>& key_columns) {
+  const auto table = Hyrise::get().storage_manager.get_table(table_name);
+  auto payload = std::vector<std::string>{};
+  for (const auto& column_name : table->column_names()) {
+    if (std::ranges::find(key_columns, column_name) == key_columns.end()) {
+      payload.emplace_back(column_name);
+    }
+  }
+  return payload;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Configuration parsed from the command line
@@ -128,14 +181,16 @@ struct Options {
   std::string out_path = "SORT_RESULTS.csv";
   std::vector<std::string> harnesses{"operator", "sql"};
   std::vector<std::string> payload_widths{"1", "4", "8", "all"};
+  std::string key_set = "shipdate";
   float scale_factor = 1.0F;
-  size_t run_count = 11;  // first run is a discarded warm-up
+  size_t run_count = 6;  // first run is a discarded warm-up, so 5 measured -- the blog's median-of-5
 };
 
 static void print_usage() {
   std::cout << "usage: sort_evaluation --routine <tag> [options]\n"
             << "  --routine  <tag>                 required; identifies the sort implementation in the CSV\n"
             << "  --sf       <float>               scale factor (default 1)\n"
+            << "  --key      <shipdate|ties|pk|comment>  sort key set (default shipdate)\n"
             << "  --harness  <operator[,sql]>      which harnesses to run (default operator,sql)\n"
             << "  --payload  <1,4,8,all>           payload widths for the operator harness\n"
             << "  --runs     <n>                   total runs; the first is a discarded warm-up (default 11)\n"
@@ -170,6 +225,8 @@ static Options parse_options(int argc, char* argv[]) {
       options.routine = next();
     } else if (flag == "--sf") {
       options.scale_factor = std::stof(next());
+    } else if (flag == "--key") {
+      options.key_set = next();
     } else if (flag == "--harness") {
       options.harnesses = split(next(), ',');
     } else if (flag == "--payload") {
@@ -195,6 +252,7 @@ static Options parse_options(int argc, char* argv[]) {
   }
 
   Assert(!options.routine.empty(), "--routine is required");
+  key_set_by_name(options.key_set);  // validates, throws with the known names
   Assert(options.run_count >= 2, "--runs must be at least 2 (one warm-up plus one measured run)");
 
   return options;
@@ -234,7 +292,8 @@ static void silent_tpch_generation(const float scale_factor, const std::shared_p
 // Keeps the sort key plus `payload_columns`, prunes everything else. An empty payload list keeps ALL columns.
 // Returns the executed GetTable, the sort definitions resolved against its (pruned) output, and the payload width.
 static std::tuple<std::shared_ptr<GetTable>, std::vector<SortColumnDefinition>, size_t> setup_get_table(
-    const std::string& table_name, const std::string& sort_column, const std::vector<std::string>& payload_columns) {
+    const std::string& table_name, const std::vector<std::string>& key_columns,
+    const std::vector<std::string>& payload_columns) {
   const auto table = Hyrise::get().storage_manager.get_table(table_name);
   const auto column_count = table->column_count();
 
@@ -243,7 +302,9 @@ static std::tuple<std::shared_ptr<GetTable>, std::vector<SortColumnDefinition>, 
     kept.resize(column_count);
     std::iota(kept.begin(), kept.end(), ColumnID{0});
   } else {
-    kept.emplace_back(table->column_id_by_name(sort_column));
+    for (const auto& column_name : key_columns) {
+      kept.emplace_back(table->column_id_by_name(column_name));
+    }
     for (const auto& column_name : payload_columns) {
       kept.emplace_back(table->column_id_by_name(column_name));
     }
@@ -260,10 +321,13 @@ static std::tuple<std::shared_ptr<GetTable>, std::vector<SortColumnDefinition>, 
   get_table->never_clear_output();
   get_table->execute();
 
-  auto sort_definitions = std::vector<SortColumnDefinition>{
-      SortColumnDefinition{get_table->get_output()->column_id_by_name(sort_column)}};
+  auto sort_definitions = std::vector<SortColumnDefinition>{};
+  sort_definitions.reserve(key_columns.size());
+  for (const auto& column_name : key_columns) {
+    sort_definitions.emplace_back(get_table->get_output()->column_id_by_name(column_name));
+  }
 
-  const auto payload_width = static_cast<size_t>(get_table->get_output()->column_count()) - 1;
+  const auto payload_width = static_cast<size_t>(get_table->get_output()->column_count()) - key_columns.size();
   return {get_table, sort_definitions, payload_width};
 }
 
@@ -356,25 +420,26 @@ static void write_header_if_needed(const std::string& path) {
   }
 
   auto out_file = std::ofstream{path};
-  out_file << "ROUTINE,BRANCH,COMMIT,MACHINE,HARNESS,MATERIALIZED,TABLE,SORT_KEY,SCALE,ENCODING,PAYLOAD_COLS,"
-              "ROW_COUNT,RUN_ID,TOTAL_US";
+  out_file << "ROUTINE,BRANCH,COMMIT,MACHINE,HARNESS,MATERIALIZED,TABLE,KEY_SET,KEY_COLS,SORT_KEY,SCALE,"
+              "ENCODING,PAYLOAD_COLS,ROW_COUNT,RUN_ID,TOTAL_US";
   for (const auto& phase : PHASES) {
     out_file << ',' << phase.csv_column;
   }
   out_file << '\n';
 }
 
-static void append_samples(const Options& options, const std::string& harness, const bool materialized,
-                           const size_t payload_columns, const size_t row_count,
-                           const std::vector<RunSample>& samples) {
+static void append_samples(const Options& options, const std::vector<std::string>& key_columns,
+                           const std::string& harness, const bool materialized, const size_t payload_columns,
+                           const size_t row_count, const std::vector<RunSample>& samples) {
   auto out_file = std::ofstream(options.out_path, std::ios::app);
+  const auto key_columns_joined = join(key_columns, ",");
 
   for (auto run_id = size_t{0}; run_id < samples.size(); ++run_id) {
     const auto& sample = samples[run_id];
-    out_file << std::format(R"("{}","{}","{}","{}","{}",{},"{}","{}",{},"{}",{},{},{},{})", options.routine,
+    out_file << std::format(R"("{}","{}","{}","{}","{}",{},"{}","{}",{},"{}",{},"{}",{},{},{},{})", options.routine,
                             options.branch, options.commit, options.machine, harness, materialized ? 1 : 0, TABLE_NAME,
-                            SORT_KEY, options.scale_factor, ENCODING_TAG, payload_columns, row_count, run_id,
-                            sample.total_us);
+                            options.key_set, key_columns.size(), key_columns_joined, options.scale_factor,
+                            ENCODING_TAG, payload_columns, row_count, run_id, sample.total_us);
     for (const auto phase_us : sample.phase_us) {
       out_file << ',' << phase_us;
     }
@@ -386,8 +451,12 @@ static void append_samples(const Options& options, const std::string& harness, c
 int main(int argc, char* argv[]) {
   const auto options = parse_options(argc, argv);
 
-  std::cout << std::format("routine={} sf={} encoding={} runs={} (1 warm-up) -> {}\n", options.routine,
-                           options.scale_factor, ENCODING_TAG, options.run_count, options.out_path);
+  const auto& key_set = key_set_by_name(options.key_set);
+  const auto sql_query = std::format("SELECT * FROM {} ORDER BY {};", TABLE_NAME, join(key_set.columns, ", "));
+
+  std::cout << std::format("routine={} sf={} key={} ({}) encoding={} runs={} (1 warm-up) -> {}\n", options.routine,
+                           options.scale_factor, options.key_set, join(key_set.columns, ", "), ENCODING_TAG,
+                           options.run_count, options.out_path);
 
   write_header_if_needed(options.out_path);
 
@@ -398,18 +467,20 @@ int main(int argc, char* argv[]) {
   benchmark_config->cache_binary_tables = true;
   silent_tpch_generation(options.scale_factor, benchmark_config);
 
+  // Depends on the generated table, so it cannot be a constant: which columns are payload depends on the key set.
+  const auto payload_order = payload_column_order(TABLE_NAME, key_set.columns);
+
   for (const auto& harness : options.harnesses) {
     if (harness == "operator") {
       for (const auto& width_tag : options.payload_widths) {
         auto payload_columns = std::vector<std::string>{};
         if (width_tag != "all") {
           const auto width = static_cast<size_t>(std::stoul(width_tag));
-          Assert(width <= PAYLOAD_COLUMN_ORDER.size(), "Payload width exceeds the number of non-key columns");
-          payload_columns.assign(PAYLOAD_COLUMN_ORDER.begin(),
-                                 PAYLOAD_COLUMN_ORDER.begin() + static_cast<std::ptrdiff_t>(width));
+          Assert(width <= payload_order.size(), "Payload width exceeds the number of non-key columns");
+          payload_columns.assign(payload_order.begin(), payload_order.begin() + static_cast<std::ptrdiff_t>(width));
         }
 
-        const auto setup = setup_get_table(TABLE_NAME, SORT_KEY, payload_columns);
+        const auto setup = setup_get_table(TABLE_NAME, key_set.columns, payload_columns);
         const auto get_table = std::get<0>(setup);
         const auto sort_definitions = std::get<1>(setup);
         const auto payload_width = std::get<2>(setup);
@@ -417,12 +488,12 @@ int main(int argc, char* argv[]) {
         std::cout << std::format("  operator: payload={} ({} columns)\n", width_tag, payload_width) << std::flush;
         const auto samples = measure_operator(get_table, sort_definitions, options.run_count);
         // ForceMaterialization::Yes, so the payload is always gathered in this harness.
-        append_samples(options, "operator", /*materialized*/ true, payload_width,
+        append_samples(options, key_set.columns, "operator", /*materialized*/ true, payload_width,
                        get_table->get_output()->row_count(), samples);
       }
     } else if (harness == "sql") {
-      std::cout << "  sql: " << SQL_QUERY << '\n' << std::flush;
-      const auto sql_result = measure_sql(SQL_QUERY, options.run_count);
+      std::cout << "  sql: " << sql_query << '\n' << std::flush;
+      const auto sql_result = measure_sql(sql_query, options.run_count);
 
       if (!sql_result.materialized) {
         std::cerr << "  WARNING: the query plan's Sort returned a reference table -- the LQPTranslator "
@@ -432,8 +503,8 @@ int main(int argc, char* argv[]) {
       }
 
       // The query is always SELECT *, so payload width is fixed rather than swept here.
-      append_samples(options, "sql", sql_result.materialized, PAYLOAD_COLUMN_ORDER.size(), sql_result.row_count,
-                     sql_result.samples);
+      append_samples(options, key_set.columns, "sql", sql_result.materialized, payload_order.size(),
+                     sql_result.row_count, sql_result.samples);
     } else {
       Fail("Unknown harness: " + harness);
     }

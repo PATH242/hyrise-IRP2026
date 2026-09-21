@@ -1,10 +1,11 @@
-\#!/usr/bin/env bash
+#!/usr/bin/env bash
 # =====================================================================================================================
 # Drives sort_evaluation over the run matrix for ONE routine branch and files the output.
 #
 #   ./run_evaluation.sh --routine kway
 #   ./run_evaluation.sh --routine baseline --dry-run
 #   ./run_evaluation.sh --routine kway --sf 10                      # single scale factor
+#   ./run_evaluation.sh --routine kway --key ties                   # single key set
 #
 # One invocation = one checked-out branch = one routine. Run it once per branch; results accumulate in a combined CSV.
 #
@@ -24,12 +25,18 @@ HYRISE_ROOT="${HYRISE_ROOT:-${HOME}/hyrise-IRP2026}"
 BINARY="${BINARY:-${HYRISE_ROOT}/cmake-build-release/SortEvaluation}"
 
 NUMA_NODE="${NUMA_NODE:-1}"
-RUNS="${RUNS:-11}"                       # first run is a discarded warm-up
-PAYLOAD="${PAYLOAD:-1,4,8,all}"
+RUNS="${RUNS:-6}"                        # 1 discarded warm-up + 5 measured, matching the blog's median-of-5
 HARNESS="${HARNESS:-operator,sql}"
 
 # Run matrix: scale factors. Add 100 here when SF 100 becomes feasible.
 SCALE_FACTORS=(1 10)
+
+# Key sets to run. `shipdate` is the blog analog and owns the payload sweep; the others are one experiment each at
+# full payload, so the key effect is the only thing varying.
+KEY_SETS=(shipdate ties pk comment)
+declare -A PAYLOAD_BY_KEY=( [shipdate]="1,4,8,all" )
+DEFAULT_PAYLOAD="all"
+PAYLOAD=""                               # set by --payload to override every key set
 
 WORK_ROOT="${WORK_ROOT:-${HERE}/work}"          # shared table cache directory
 RESULTS_ROOT="${RESULTS_ROOT:-${HERE}/results}"
@@ -44,6 +51,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --routine)     ROUTINE="$2"; shift 2 ;;
     --sf)          IFS=',' read -r -a SCALE_FACTORS <<< "$2"; shift 2 ;;
+    --key)         IFS=',' read -r -a KEY_SETS <<< "$2"; shift 2 ;;
     --binary)      BINARY="$2"; shift 2 ;;
     --runs)        RUNS="$2"; shift 2 ;;
     --payload)     PAYLOAD="$2"; shift 2 ;;
@@ -87,14 +95,21 @@ log "source    : ${BRANCH} @ ${COMMIT}"
 log "binary    : ${BINARY}"
 log "machine   : ${MACHINE}, NUMA node ${NUMA_NODE}"
 log "scale f.  : ${SCALE_FACTORS[*]}"
-log "payload   : ${PAYLOAD}   harness: ${HARNESS}   runs: ${RUNS}"
+log "key sets  : ${KEY_SETS[*]}"
+log "harness   : ${HARNESS}   runs: ${RUNS} (1 warm-up)"
 log "output    : ${RUN_CSV}"
+
+payload_for() {  # per-key payload widths, unless --payload overrode them
+  if [[ -n "$PAYLOAD" ]]; then echo "$PAYLOAD"; else echo "${PAYLOAD_BY_KEY[$1]:-$DEFAULT_PAYLOAD}"; fi
+}
 
 if [[ $DRY_RUN -eq 1 ]]; then
   for sf in "${SCALE_FACTORS[@]}"; do
-    echo "  DRY: (cd ${WORK_ROOT} && numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE} ${BINARY}" \
-         "--routine ${ROUTINE} --sf ${sf} --payload ${PAYLOAD} --harness ${HARNESS}" \
-         "--runs ${RUNS} --out ${RUN_CSV} --branch ${BRANCH} --commit ${COMMIT} --machine ${MACHINE})"
+    for key in "${KEY_SETS[@]}"; do
+      echo "  DRY: (cd ${WORK_ROOT} && numactl --cpunodebind=${NUMA_NODE} --membind=${NUMA_NODE} ${BINARY}" \
+           "--routine ${ROUTINE} --sf ${sf} --key ${key} --payload $(payload_for "$key") --harness ${HARNESS}" \
+           "--runs ${RUNS} --out ${RUN_CSV} --branch ${BRANCH} --commit ${COMMIT} --machine ${MACHINE})"
+    done
   done
   exit 0
 fi
@@ -114,7 +129,8 @@ mkdir -p "$RUN_DIR" "$RESULTS_ROOT"
   echo "binary_sha256  : $(sha256sum "$BINARY" | cut -d' ' -f1)"
   echo "binary_mtime   : $(date -u -r "$BINARY" +%Y-%m-%dT%H:%M:%SZ)"
   echo "scale_factors  : ${SCALE_FACTORS[*]}"
-  echo "payload_widths : ${PAYLOAD}"
+  echo "key_sets       : ${KEY_SETS[*]}"
+  echo "payload_widths : ${PAYLOAD:-per key set; shipdate=${PAYLOAD_BY_KEY[shipdate]}, others=${DEFAULT_PAYLOAD}}"
   echo "harnesses      : ${HARNESS}"
   echo "runs_per_cell  : ${RUNS} (first discarded as warm-up)"
   echo "work_root      : ${WORK_ROOT}"
@@ -127,27 +143,30 @@ log "manifest  : ${MANIFEST}"
 
 # --- run -------------------------------------------------------------------------------------------------------
 failures=0
+mkdir -p "$WORK_ROOT"
 for sf in "${SCALE_FACTORS[@]}"; do
-  cell_log="${RUN_DIR}/cell_sf${sf}.log"
+  for key in "${KEY_SETS[@]}"; do
+    cell_log="${RUN_DIR}/cell_sf${sf}_${key}.log"
+    widths="$(payload_for "$key")"
+    log "cell sf=${sf} key=${key} payload=${widths}"
 
-  mkdir -p "$WORK_ROOT"
-  log "cell sf=${sf}  (cwd ${WORK_ROOT})"
+    ( cd "$WORK_ROOT" && numactl "--cpunodebind=${NUMA_NODE}" "--membind=${NUMA_NODE}" "$BINARY" \
+        --routine "$ROUTINE" \
+        --sf "$sf" \
+        --key "$key" \
+        --payload "$widths" \
+        --harness "$HARNESS" \
+        --runs "$RUNS" \
+        --out "$RUN_CSV" \
+        --branch "$BRANCH" \
+        --commit "$COMMIT" \
+        --machine "$MACHINE" ) > "$cell_log" 2>&1
 
-  ( cd "$WORK_ROOT" && numactl "--cpunodebind=${NUMA_NODE}" "--membind=${NUMA_NODE}" "$BINARY" \
-      --routine "$ROUTINE" \
-      --sf "$sf" \
-      --payload "$PAYLOAD" \
-      --harness "$HARNESS" \
-      --runs "$RUNS" \
-      --out "$RUN_CSV" \
-      --branch "$BRANCH" \
-      --commit "$COMMIT" \
-      --machine "$MACHINE" ) > "$cell_log" 2>&1
-
-  if [[ $? -ne 0 ]]; then
-    warn "FAILED: sf=${sf} -- see ${cell_log}"
-    failures=$((failures + 1))
-  fi
+    if [[ $? -ne 0 ]]; then
+      warn "FAILED: sf=${sf} key=${key} -- see ${cell_log}"
+      failures=$((failures + 1))
+    fi
+  done
 done
 
 # --- combine ---------------------------------------------------------------------------------------------------
