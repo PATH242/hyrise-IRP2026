@@ -561,17 +561,23 @@ std::vector<size_t> compute_intersections(
   return intersections;
 }
 
-// Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine instead
-// of the input size (a fixed partition size makes the partition count a function of the row count, which leaves
-// workers idle on small inputs and produces a ragged final wave on medium ones). Falls back to a single partition when
-// no worker-based scheduler is set, which keeps the merge correct and serial. Never exceeds row_count, so every
-// partition emits at least one row.
-size_t determine_merge_partition_count(const size_t row_count) {
+// Number of workers the merge can occupy. Falls back to one when no worker-based scheduler is set, which keeps every
+// merge step correct and serial. Shared by the level cascade (whether a level of independent merges fills the machine)
+// and the merge path (how many partitions the finish is split into), so both decisions see the same number.
+size_t merge_worker_count() {
   auto worker_count = size_t{1};
   if (const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(Hyrise::get().scheduler())) {
-    worker_count = static_cast<size_t>(node_queue_scheduler->active_worker_count());
+    worker_count = std::max(size_t{1}, static_cast<size_t>(node_queue_scheduler->active_worker_count()));
   }
-  return std::clamp(worker_count, size_t{1}, row_count);
+  return worker_count;
+}
+
+// Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine instead
+// of the input size (a fixed partition size makes the partition count a function of the row count, which leaves
+// workers idle on small inputs and produces a ragged final wave on medium ones). Never exceeds row_count, so every
+// partition emits at least one row.
+size_t determine_merge_partition_count(const size_t row_count) {
+  return std::clamp(merge_worker_count(), size_t{1}, row_count);
 }
 
 // Merge path for the k-way merge: compute the partition boundaries only, so that this phase can be timed separately
@@ -614,111 +620,79 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   return boundaries;
 }
 
-// Maximum fan-in of a single k-way merge, i.e. the cap on how many runs one loser tree may merge at once. This is the
-// knob; the number of levels follows from it and from the run count, rather than the other way round. With a cap of c
-// and R runs, a partition performs ceil(R / c) merges of at most c runs each, then repeats on the results until at most
-// c runs are left, which the final level merges straight into the position list. For R = 192 and c = 32 that is six
-// 32-way merges followed by one 6-way merge.
+// Number of independent k-way merges in the first stage (see merge_first_stage). This is the single place to change
+// the policy. The default is one merge per worker, so the first stage fills the machine without merge path, and the
+// fan-in of each merge follows from it: k = ceil(run_count / merge_count), i.e. chunks / workers.
 //
-// A cap of 0 or one at least as large as the run count is the plain single-level merge over every run, so the previous
-// behaviour is just the top of this knob's range.
-//
-// This is the single place to make the cap adaptive: return a function of the run count (e.g. ceil(sqrt(run_count)),
-// which always yields exactly two levels), the partition's row count, or the machine instead of a constant.
-size_t determine_merge_fan_in(const size_t /*run_count*/, const size_t /*row_count*/) {
-  constexpr auto MAX_MERGE_FAN_IN = size_t{32};
-  return MAX_MERGE_FAN_IN;
+// Returning a value <= 1, or one >= run_count, skips the first stage entirely (single partitioned merge over every
+// run -- the previous behaviour).
+size_t determine_first_stage_merge_count(const size_t /*run_count*/, const size_t /*row_count*/,
+                                         const size_t worker_count) {
+  return worker_count;
 }
 
-// How many intermediate levels a partition of `run_count` runs needs under `fan_in`, i.e. how many levels write to
-// scratch before the final level writes RowIDs. Zero means the single-level merge.
-size_t merge_intermediate_level_count(const size_t run_count, const size_t fan_in) {
-  if (fan_in < 2) {
-    return 0;  // an unusable cap collapses to the single-level merge
+// First stage: split `runs` into exactly `merge_count` contiguous, balanced groups -- so each group holds
+// floor(R / merge_count) or ceil(R / merge_count) runs, and k = ceil(R / merge_count) -- and merge every group with its
+// own loser tree, one task per group, no merge path. The merged groups are written to `output` in merged order (at the
+// prefix sum of the group sizes). Returns one run per group, in group order, for the second stage.
+//
+// A group that holds a single run is already sorted, so it is passed through untouched rather than copied: its entry
+// in the returned list simply points at the original run. When runs are only slightly more than merges (e.g. 153 runs
+// on 120 workers, where 87 groups are singletons), this avoids a pass over most of the data that would change nothing.
+//
+// Groups are contiguous in run order and every loser tree breaks ties by lowest index, so a row from an earlier run
+// still precedes an equal row from a later run after both stages: the pipeline stays stable.
+std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>> merge_first_stage(
+    const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
+    const size_t merge_count, NormalizedKeyRow* output) {
+  const auto run_count = runs.size();
+  DebugAssert(merge_count > 1 && merge_count < run_count, "The first stage must reduce the run count to > 1 runs.");
+
+  const auto group_first_run = [&](const size_t group) {
+    return run_count * group / merge_count;
+  };
+
+  auto group_offsets = std::vector<size_t>(merge_count + 1, 0);
+  for (auto group = size_t{0}; group < merge_count; ++group) {
+    const auto first_run = group_first_run(group);
+    const auto last_run = group_first_run(group + 1);
+    DebugAssert(first_run < last_run, "Balanced grouping must not produce an empty group.");
+    auto group_row_count = size_t{0};
+    for (auto run = first_run; run < last_run; ++run) {
+      group_row_count += static_cast<size_t>(runs[run].second - runs[run].first);
+    }
+    group_offsets[group + 1] = group_offsets[group] + group_row_count;
   }
 
-  auto level_count = size_t{0};
-  auto live_count = run_count;
-  while (live_count > fan_in) {
-    live_count = div_ceil(live_count, fan_in);
-    ++level_count;
-  }
-  return level_count;
-}
+  auto merged_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(merge_count);
+  auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+  merge_tasks.reserve(merge_count);
+  for (auto group = size_t{0}; group < merge_count; ++group) {
+    const auto first_run = group_first_run(group);
+    const auto last_run = group_first_run(group + 1);
 
-// Merge one output partition as a cascade of k-way merges, each with at most `fan_in` runs. `live` are the
-// partition's (already pruned) runs, in run order.
-//
-// While more than `fan_in` runs are left, the level splits them into ceil(live / fan_in) contiguous, balanced groups
-// and merges each group with its own loser tree into a scratch buffer; the merged groups become the runs of the next
-// level. The last level merges what is left straight into `output` as RowIDs, so the extraction stays fused. The
-// number of levels therefore follows from the run count: it is one as long as a partition has at most `fan_in` runs.
-//
-// Groups are contiguous ranges of the run order and every tree breaks ties by lowest index, so a row that came from an
-// earlier run still precedes an equal row from a later run after any number of levels: the nested merge is as stable
-// as the single-level one.
-//
-// `buffers` holds up to two scratch ranges, each at least `row_count` long and private to this partition. Two are
-// enough at any number of levels: a level reads the buffer the previous level wrote and writes the other one, whose
-// contents were already consumed. A null buffer (or a cap that no level can use) collapses this to a single merge.
-void merge_partition_nested(std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>> live,
-                            const size_t key_size, const size_t row_count, RowID* output,
-                            const std::array<NormalizedKeyRow*, 2>& buffers, const size_t fan_in) {
-  auto buffer_index = size_t{0};
-
-  while (fan_in >= 2 && live.size() > fan_in) {
-    const auto live_count = live.size();
-    const auto group_count = div_ceil(live_count, fan_in);
-    DebugAssert(group_count > 1, "More than fan_in runs must split into more than one group.");
-
-    auto* destination = buffers[buffer_index];
-    if (destination == nullptr) {
-      break;  // no scratch for this level: fall back to merging everything that is left in one go
+    if (last_run - first_run == 1) {
+      merged_runs[group] = runs[first_run];  // singleton: already sorted, pass through without copying
+      continue;
     }
 
-    auto next = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
-    next.reserve(group_count);
-
-    auto written = size_t{0};
-    for (auto group = size_t{0}; group < group_count; ++group) {
-      const auto first_run = live_count * group / group_count;
-      const auto last_run = live_count * (group + 1) / group_count;
-      DebugAssert(first_run < last_run, "Balanced grouping must not produce an empty group.");
-      DebugAssert(last_run - first_run <= fan_in, "A group must not exceed the fan-in cap.");
-
+    auto* group_output = output + group_offsets[group];
+    merged_runs[group] = {group_output, group_output + (group_offsets[group + 1] - group_offsets[group])};
+    merge_tasks.emplace_back(std::make_shared<JobTask>([&, group, first_run, last_run, group_output]() {
       auto group_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(
-          live.begin() + static_cast<std::ptrdiff_t>(first_run),
-          live.begin() + static_cast<std::ptrdiff_t>(last_run));
-
-      auto group_row_count = size_t{0};
-      for (const auto& run : group_runs) {
-        group_row_count += static_cast<size_t>(run.second - run.first);
-      }
-
-      auto* group_output = destination + written;
-      merge_partition_of_sorted_runs(group_runs, key_size, group_row_count, group_output);
-      next.emplace_back(group_output, group_output + group_row_count);
-      written += group_row_count;
-    }
-    DebugAssert(written == row_count, "A level must move every row of the partition.");
-
-    live = std::move(next);
-    buffer_index ^= 1;
+          runs.begin() + static_cast<std::ptrdiff_t>(first_run), runs.begin() + static_cast<std::ptrdiff_t>(last_run));
+      merge_partition_of_sorted_runs(group_runs, key_size, group_offsets[group + 1] - group_offsets[group],
+                                     group_output);
+    }));
   }
+  Hyrise::get().scheduler()->schedule_and_wait_for_tasks(merge_tasks);
 
-  merge_partition_of_sorted_runs(live, key_size, row_count, output);
+  return merged_runs;
 }
 
-// Parallel k-way merge: merge each output partition delimited by `boundaries` independently, writing RowIDs straight
-// into that partition's slice of the position list. The boundaries are precomputed by compute_merge_path_boundaries so
-// that the merge path is its own phase.
-//
-// Within a partition the merge is a cascade of k-way merges capped at determine_merge_fan_in() runs each (see
-// merge_partition_nested). How many levels that takes follows from the run count, so a run count at or below the cap
-// costs exactly one level and touches the data once, as before. Each intermediate level needs scratch, ping-ponged
-// between at most two buffers, each as long as the whole output because a partition's buffer slice is exactly its own
-// output range. TODO: `sort_scratch` in _on_execute is already a row-count-sized NormalizedKeyRow buffer and is dead by
-// this point -- passing it in would save one of these allocations.
+// Second stage: merge each output partition delimited by `boundaries` independently, writing
+// RowIDs straight into that partition's slice of the position list. The boundaries are precomputed by
+// compute_merge_path_boundaries so that the merge path is its own phase.
 RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
                               const size_t key_size, const size_t row_count,
                               const std::vector<std::vector<size_t>>& boundaries) {
@@ -730,14 +704,6 @@ RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow
   const auto run_count = runs.size();
   DebugAssert(boundaries.size() >= 2, "Expected at least one partition for a non-empty input.");
   const auto partitions_count = boundaries.size() - 1;
-
-  const auto merge_fan_in = determine_merge_fan_in(run_count, row_count);
-  // A partition holds at most `run_count` runs, so the level count for the whole run list bounds every partition's.
-  const auto buffer_count = std::min(merge_intermediate_level_count(run_count, merge_fan_in), size_t{2});
-  auto level_buffers = std::vector<uninitialized_vector<NormalizedKeyRow>>(buffer_count);
-  for (auto& buffer : level_buffers) {
-    buffer = uninitialized_vector<NormalizedKeyRow>(row_count);
-  }
 
   // Merge each partition independently and in parallel, writing RowIDs straight into its slice of position_list.
   auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
@@ -757,14 +723,7 @@ RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow
         }
       }
       if (!sub_runs.empty()) {
-        // Each partition owns the [out_begin, out_end) slice of every level buffer, which is exactly as long as the
-        // rows it emits, so the levels never touch another partition's scratch.
-        auto partition_buffers = std::array<NormalizedKeyRow*, 2>{nullptr, nullptr};
-        for (auto buffer_index = size_t{0}; buffer_index < buffer_count; ++buffer_index) {
-          partition_buffers[buffer_index] = level_buffers[buffer_index].data() + out_begin;
-        }
-        merge_partition_nested(std::move(sub_runs), key_size, out_end - out_begin,
-                               position_list.data() + out_begin, partition_buffers, merge_fan_in);
+        merge_partition_of_sorted_runs(sub_runs, key_size, out_end - out_begin, position_list.data() + out_begin);
       }
     }));
   }
@@ -1258,7 +1217,8 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto materialization_time = timer.lap();
 
-  // Scratch buffer used only by the radix run generation (the k-way merge allocates its own buffers).
+  // Scratch buffer for the radix run generation. Dead once the runs are sorted, so the merge cascade reuses it as one
+  // of its two ping-pong buffers (see below).
   auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(USE_RADIX_SORT ? input_table->row_count() : size_t{0});
 
   // Sort each chunk's slice of the materialized rows independently and in parallel. Every chunk becomes a sorted run
@@ -1284,7 +1244,13 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto sort_time = timer.lap();
 
-  // Merge the k sorted runs (k = chunk count) into the final position list.
+  // Merge the sorted runs (one per chunk) into the final position list, in two stages:
+  //   1. First stage: W independent k-way merges with k = ceil(runs / W) (see determine_first_stage_merge_count), one
+  //      task each, no partitioning. Writes NormalizedKeyRows into sort_scratch (dead since run generation); singleton
+  //      groups are passed through without copying. Skipped when there are no more runs than merges.
+  //   2. Second stage: one k-way merge over the (at most W) runs left, split by merge path into one partition per
+  //      worker, writing RowIDs. Its fan-in is whatever the first stage left, not the first stage's k.
+  const auto row_count = materialized_rows.size();
   auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
   runs.reserve(chunk_count);
   for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
@@ -1292,26 +1258,37 @@ std::shared_ptr<const Table> Sort::_on_execute() {
                       materialized_rows.data() + chunk_offsets[run_index + 1]);
   }
 
-  // Merge path: one partition per active worker, computed as its own phase so that the cost of finding the
-  // boundaries is reported separately from the cost of merging.
-  const auto merge_partition_count = determine_merge_partition_count(materialized_rows.size());
+  const auto worker_count = merge_worker_count();
+  const auto first_stage_merge_count = determine_first_stage_merge_count(runs.size(), row_count, worker_count);
+  if (first_stage_merge_count > 1 && first_stage_merge_count < runs.size()) {
+    if (sort_scratch.size() < row_count) {
+      sort_scratch = uninitialized_vector<NormalizedKeyRow>(row_count);  // only without radix run generation
+    }
+    runs = merge_first_stage(runs, normalized_key_size, first_stage_merge_count, sort_scratch.data());
+  }
+
+  const auto level_time = timer.lap();
+
+  // Merge path of the finish: one partition per active worker, computed as its own phase so that the cost of finding
+  // the boundaries is reported separately from the cost of merging.
+  const auto merge_partition_count = determine_merge_partition_count(row_count);
   const auto merge_path_boundaries =
-      compute_merge_path_boundaries(runs, normalized_key_size, materialized_rows.size(), merge_partition_count);
+      compute_merge_path_boundaries(runs, normalized_key_size, row_count, merge_partition_count);
 
   const auto merge_path_time = timer.lap();
 
-  auto position_list =
-      merge_partitions(runs, normalized_key_size, materialized_rows.size(), merge_path_boundaries);
+  auto position_list = merge_partitions(runs, normalized_key_size, row_count, merge_path_boundaries);
 
-  const auto merge_time = timer.lap();
+  const auto finish_time = timer.lap();
 
-  // Note: Sort covers the parallel run generation, MergePath the computation of the merge-path partition boundaries,
-  // and TemporaryResultWriting the merge itself (which also writes the temporary result, i.e., the position list).
+  // Note: Sort covers the parallel run generation, MergePath the second stage's merge-path boundaries, and
+  // TemporaryResultWriting all merging -- the first stage plus the partitioned second stage, which also writes the
+  // temporary result (the position list).
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
   step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
+  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, level_time + finish_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
