@@ -11,6 +11,7 @@
 #include <format>
 #include <iterator>
 #include <limits>
+#include <list>
 #include <memory>
 #include <numeric>
 #include <ranges>
@@ -60,28 +61,31 @@ auto div_ceil(const auto left, const auto right) {
   return (left + right - 1) / right;
 }
 
-// Run generation (sink phase): every chunk's slice of the row array is sorted independently into one sorted run, and
-// the runs are k-way merged afterwards. The algorithm is a compile-time switch so that all variants share one code path
-// for everything else (materialization, merge path, merge, output).
+// Run generation (sink phase): the materialized row array is split into one contiguous slice per active worker, each
+// slice is sorted independently into one sorted run (DuckDB: one thread-local sorted run per thread), and the runs are
+// k-way merged afterwards. The algorithm is a compile-time switch so that all variants share one code path for
+// everything else (materialization, merge path, merge, output).
 //   Pdqsort   - boost::sort::pdqsort with the full comparator. Unstable.
 //   Radix     - the out-of-place LSD/MSD radix sort below. Stable.
-//   Vergesort - run detection and run merging on top of VERGESORT_FALLBACK (DuckDB v1.4 design). Stable iff the
-//               fallback is stable.
+//   Vergesort - run detection and run merging on top of VERGESORT_FALLBACK (DuckDB v1.4 design). Unstable: upstream
+//               vergesort reverses non-ascending stretches, including stretches of equal keys.
 enum class RunGenerationAlgorithm : uint8_t { Pdqsort, Radix, Vergesort };
 constexpr auto RUN_GENERATION = RunGenerationAlgorithm::Vergesort;
 
 // Sorts the parts of a run that vergesort does not cover with detected runs.
 //   SkaSort - in-place MSD radix sort over the 8-byte inline prefix; pdqsort for small partitions and, if the key is
 //             longer than 8 bytes, for prefix ties (DuckDB v1.4 cascade: vergesort -> ska sort -> pdqsort). Unstable.
-//   Radix   - the stable radix sort below; makes the whole pipeline stable.
+//   Radix   - the out-of-place radix sort below (not part of the DuckDB design; kept for ablation).
 enum class VergesortFallback : uint8_t { SkaSort, Radix };
 constexpr auto VERGESORT_FALLBACK = VergesortFallback::SkaSort;
 
-// Vergesort and ska sort tuning constants. Initial values, not tuned for Hyrise yet.
-// Below VERGESORT_MIN_SIZE rows, vergesort calls the fallback directly (upstream value: 128).
+// Vergesort and ska sort tuning constants, all set to the upstream defaults.
+// Below VERGESORT_MIN_SIZE rows, vergesort does not probe for runs (upstream: 128).
 constexpr size_t VERGESORT_MIN_SIZE = 128;
-// Partitions of at most SKA_SORT_PDQSORT_THRESHOLD rows are handed from ska sort to pdqsort.
-constexpr size_t SKA_SORT_PDQSORT_THRESHOLD = 128;
+// Ska sort: partitions below this size are sorted with pdqsort (upstream StdSortThreshold: 128).
+constexpr size_t SKA_SORT_STD_SORT_THRESHOLD = 128;
+// Ska sort: partitions up to this size use American flag sort, larger ones ska byte sort (upstream: 1024).
+constexpr size_t SKA_SORT_AMERICAN_FLAG_THRESHOLD = 1024;
 
 // Radix sort tuning constants.
 constexpr size_t RADIX_BUCKET_SIZE = 256;
@@ -276,6 +280,8 @@ std::shared_ptr<Table> write_reference_output_table(const std::shared_ptr<const 
   return output_table;
 }
 
+// BEGIN_SORT_KERNELS (marker for standalone kernel tests)
+
 /**
  * Implementation of DuckDB's static memcmp. This optimizes calls to memcmp by passing a compile-time known length. If
  * optimized correctly the compiler would resolve the implementation to a switch like statement.
@@ -334,11 +340,10 @@ struct NormalizedKeyRow {
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Radix sort (run generation). Drop-in replacement for the per-run pdqsort. LSD for keys <= 4 bytes, MSD otherwise,
-// with an insertion-sort base case and a single-bucket skip. Operates only on the first `key_size`
-// (= normalized_key_size) bytes, never the padded tail, so the uninitialized padding is never read. The radix sort is
-// stable (counting-sort scatter in input order + strict-less insertion sort), so combined with the run-order tie-break
-// in the merge, the whole pipeline is a stable sort when RUN_GENERATION is Radix, or Vergesort with the Radix fallback.
+// Radix sort (run generation or vergesort fallback; not part of the DuckDB v1.4 design, kept for ablation). LSD for
+// keys <= 4 bytes, MSD otherwise, with an insertion-sort base case and a single-bucket skip. Operates only on the
+// first `key_size` (= normalized_key_size) bytes, never the padded tail, so the uninitialized padding is never read.
+// Stable (counting-sort scatter in input order + strict-less insertion sort).
 // ---------------------------------------------------------------------------------------------------------------------
 
 [[maybe_unused]] inline size_t radix_byte_at(const NormalizedKeyRow& row, size_t byte_index) {
@@ -357,8 +362,8 @@ struct NormalizedKeyRow {
   }
 }
 
-[[maybe_unused]] void msd_radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res, size_t byte_index,
-                    size_t key_size) {
+[[maybe_unused]] void msd_radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res,
+                                     size_t byte_index, size_t key_size) {
   const auto row_count = static_cast<size_t>(end - begin);
   if (row_count <= 1) {
     return;
@@ -401,7 +406,8 @@ struct NormalizedKeyRow {
   }
 }
 
-[[maybe_unused]] void lsd_radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res, size_t key_size) {
+[[maybe_unused]] void lsd_radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res,
+                                     size_t key_size) {
   const auto row_count = static_cast<size_t>(end - begin);
   if (row_count <= 1) {
     return;
@@ -431,9 +437,10 @@ struct NormalizedKeyRow {
 }
 
 // `res` must be at least (end - begin) long.
-[[maybe_unused]] void radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res, size_t key_size) {
+[[maybe_unused]] void radix_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, NormalizedKeyRow* res,
+                                 size_t key_size) {
   if (end - begin <= 1) {
-    return; 
+    return;
   }
   if (key_size <= 4) {
     lsd_radix_sort(begin, end, res, key_size);
@@ -443,249 +450,401 @@ struct NormalizedKeyRow {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Ska sort (vergesort fallback). In-place MSD radix sort over the inline 8-byte prefix, following DuckDB v1.4: radix
-// sort on the first 64-bit integer of the key, and pdqsort once a partition becomes small or once the prefix is
-// exhausted while the key is longer than 8 bytes. The radix passes read only row.prefix, which lives in the row array,
-// so they never dereference key_head. The permutation is the American-flag cycle-leader loop, i.e., the same in-place
-// scheme as ska_sort without ska_sort's unrolled multi-bucket swap loop. Unstable.
+// Ska sort (vergesort fallback). Port of skarupke/ska_sort's in-place MSD radix sort (inplace_radix_sort<128, 1024>)
+// with the 8-byte inline prefix as the extracted key, which is what DuckDB v1.4 radix-sorts ("the first 64-bit integer
+// of the sort key"). Per partition:
+//   size <  SKA_SORT_STD_SORT_THRESHOLD      -> pdqsort                     (upstream: std::sort)
+//   size <= SKA_SORT_AMERICAN_FLAG_THRESHOLD -> American flag sort          (upstream american_flag_sort)
+//   otherwise                                -> ska byte sort               (upstream ska_byte_sort)
+// After the last prefix byte, all rows of a partition share their prefix: for keys of at most 8 bytes they are equal
+// and the recursion stops (upstream: no recursion after the last byte); longer keys are handed to pdqsort with the
+// full comparator (upstream: next_sort; DuckDB: "not fully sorted after the first 64-bit integer -> pdqsort").
+// The radix passes read only row.prefix, which lives in the row array, so they never dereference key_head.
+//
+// Deviations from upstream:
+//  1. The radix depth is min(8, key_size) bytes instead of all 8 bytes of the uint64: prefix bytes past the key are
+//     zero padding and would only cost counting passes.
+//  2. Upstream's unroll_loop_four_times in the ska byte sort swap loop is a plain loop here.
 // ---------------------------------------------------------------------------------------------------------------------
 
 inline size_t prefix_byte_at(const NormalizedKeyRow& row, const size_t byte_index) {
   return static_cast<size_t>((row.prefix >> (56 - (8 * byte_index))) & uint64_t{0xFF});
 }
 
-void ska_sort_recursive(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t byte_index,
-                        const size_t key_size) {
+struct SkaPartitionInfo {
+  size_t count = 0;
+  size_t offset = 0;
+  size_t next_offset = 0;
+};
+
+// Upstream custom_std_partition: like std::partition, but guarantees that `predicate` is called exactly once per
+// element, in order (the predicate of the ska byte sort has side effects).
+template <typename Predicate>
+uint8_t* ska_custom_partition(uint8_t* begin, uint8_t* end, const Predicate& predicate) {
+  for (;; ++begin) {
+    if (begin == end) {
+      return end;
+    }
+    if (!predicate(*begin)) {
+      break;
+    }
+  }
+  auto* it = begin;
+  for (++it; it != end; ++it) {
+    if (!predicate(*it)) {
+      continue;
+    }
+    std::swap(*begin, *it);
+    ++begin;
+  }
+  return begin;
+}
+
+void ska_sort_partition(NormalizedKeyRow* begin, NormalizedKeyRow* end, size_t byte_index, size_t key_size);
+
+// Upstream StdSortIfLessThanThreshold: returns true if the range was fully handled (<= 1 row, or pdqsorted).
+inline bool ska_pdqsort_if_less_than_threshold(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t key_size) {
   const auto row_count = static_cast<size_t>(end - begin);
   if (row_count <= 1) {
-    return;
+    return true;
   }
-
-  const auto less = [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
+  if (row_count >= SKA_SORT_STD_SORT_THRESHOLD) {
+    return false;
+  }
+  boost::sort::pdqsort(begin, end, [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
     return lhs.less_than(rhs, key_size);
-  };
+  });
+  return true;
+}
 
-  // Prefix exhausted: all rows share their prefix. Keys of at most 8 bytes are therefore equal; longer keys still need
-  // to be ordered by their tail.
-  if (byte_index >= std::min(sizeof(uint64_t), key_size)) {
-    if (key_size > sizeof(uint64_t)) {
-      boost::sort::pdqsort(begin, end, less);
-    }
-    return;
-  }
+// True if radix-sorting byte `byte_index` finishes the ordering, i.e., no recursion into the partitions is needed.
+inline bool ska_is_last_level(const size_t byte_index, const size_t key_size) {
+  return byte_index + 1 >= std::min(sizeof(uint64_t), key_size) && key_size <= sizeof(uint64_t);
+}
 
-  if (row_count <= SKA_SORT_PDQSORT_THRESHOLD) {
-    boost::sort::pdqsort(begin, end, less);
-    return;
-  }
-
-  auto count = std::array<size_t, RADIX_BUCKET_SIZE>{};
+void ska_american_flag_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t byte_index,
+                            const size_t key_size) {
+  auto partitions = std::array<SkaPartitionInfo, RADIX_BUCKET_SIZE>{};
   for (auto* it = begin; it != end; ++it) {
-    ++count[prefix_byte_at(*it, byte_index)];
+    ++partitions[prefix_byte_at(*it, byte_index)].count;
   }
-
-  // Single-bucket skip: if every row shares this byte, recurse without moving any data.
-  if (count[prefix_byte_at(*begin, byte_index)] == row_count) {
-    ska_sort_recursive(begin, end, byte_index + 1, key_size);
-    return;
-  }
-
-  auto bucket_start = std::array<size_t, RADIX_BUCKET_SIZE>{};
-  auto bucket_end = std::array<size_t, RADIX_BUCKET_SIZE>{};
-  auto running = size_t{0};
+  auto remaining_partitions = std::array<uint8_t, RADIX_BUCKET_SIZE>{};
+  auto total = size_t{0};
+  auto partition_count = size_t{0};
   for (auto bucket = size_t{0}; bucket < RADIX_BUCKET_SIZE; ++bucket) {
-    bucket_start[bucket] = running;
-    running += count[bucket];
-    bucket_end[bucket] = running;
+    const auto count = partitions[bucket].count;
+    if (!count) {
+      continue;
+    }
+    partitions[bucket].offset = total;
+    total += count;
+    partitions[bucket].next_offset = total;
+    remaining_partitions[partition_count] = static_cast<uint8_t>(bucket);
+    ++partition_count;
   }
 
-  // In-place permutation: take the next unplaced row of the current bucket and keep swapping it to the next free slot
-  // of its own bucket until a row of the current bucket comes back, then place that one.
-  auto next_free = bucket_start;
-  for (auto bucket = size_t{0}; bucket < RADIX_BUCKET_SIZE; ++bucket) {
-    while (next_free[bucket] < bucket_end[bucket]) {
-      auto row = begin[next_free[bucket]];
-      auto row_bucket = prefix_byte_at(row, byte_index);
-      while (row_bucket != bucket) {
-        std::swap(row, begin[next_free[row_bucket]++]);
-        row_bucket = prefix_byte_at(row, byte_index);
+  if (partition_count > 1) {
+    auto* current_block_ptr = remaining_partitions.data();
+    auto* current_block = &partitions[*current_block_ptr];
+    auto* const last_block = remaining_partitions.data() + partition_count - 1;
+    auto* it = begin;
+    auto* block_end = begin + current_block->next_offset;
+    auto* const last_element = end - 1;
+    auto done = false;
+    while (!done) {
+      auto* block = &partitions[prefix_byte_at(*it, byte_index)];
+      if (block == current_block) {
+        ++it;
+        if (it == last_element) {
+          break;
+        }
+        if (it == block_end) {
+          while (true) {
+            ++current_block_ptr;
+            if (current_block_ptr == last_block) {
+              done = true;
+              break;
+            }
+            current_block = &partitions[*current_block_ptr];
+            if (current_block->offset != current_block->next_offset) {
+              break;
+            }
+          }
+          if (!done) {
+            it = begin + current_block->offset;
+            block_end = begin + current_block->next_offset;
+          }
+        }
+      } else {
+        const auto offset = block->offset++;
+        std::swap(*it, begin[offset]);
       }
-      begin[next_free[bucket]++] = row;
     }
   }
 
+  if (ska_is_last_level(byte_index, key_size)) {
+    return;
+  }
+  auto start_offset = size_t{0};
+  for (auto index = size_t{0}; index < partition_count; ++index) {
+    const auto end_offset = partitions[remaining_partitions[index]].next_offset;
+    if (!ska_pdqsort_if_less_than_threshold(begin + start_offset, begin + end_offset, key_size)) {
+      ska_sort_partition(begin + start_offset, begin + end_offset, byte_index + 1, key_size);
+    }
+    start_offset = end_offset;
+  }
+}
+
+void ska_byte_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t byte_index, const size_t key_size) {
+  auto partitions = std::array<SkaPartitionInfo, RADIX_BUCKET_SIZE>{};
+  for (auto* it = begin; it != end; ++it) {
+    ++partitions[prefix_byte_at(*it, byte_index)].count;
+  }
+  auto remaining_partitions = std::array<uint8_t, RADIX_BUCKET_SIZE>{};
+  auto total = size_t{0};
+  auto partition_count = size_t{0};
   for (auto bucket = size_t{0}; bucket < RADIX_BUCKET_SIZE; ++bucket) {
-    if (count[bucket] > 1) {
-      ska_sort_recursive(begin + bucket_start[bucket], begin + bucket_end[bucket], byte_index + 1, key_size);
+    const auto count = partitions[bucket].count;
+    if (count) {
+      partitions[bucket].offset = total;
+      total += count;
+      remaining_partitions[partition_count] = static_cast<uint8_t>(bucket);
+      ++partition_count;
+    }
+    partitions[bucket].next_offset = total;
+  }
+
+  // Swap every row of every unfinished partition to the next free slot of its target partition; drop finished
+  // partitions from the list; repeat until at most one partition is unfinished (it is then in place, too).
+  for (auto *last_remaining = remaining_partitions.data() + partition_count,
+            *end_partition = remaining_partitions.data() + 1;
+       last_remaining > end_partition;) {
+    last_remaining = ska_custom_partition(remaining_partitions.data(), last_remaining, [&](const uint8_t partition) {
+      auto& begin_offset = partitions[partition].offset;
+      const auto end_offset = partitions[partition].next_offset;
+      if (begin_offset == end_offset) {
+        return false;
+      }
+      auto* it = begin + begin_offset;
+      const auto swap_count = end_offset - begin_offset;
+      for (auto index = size_t{0}; index < swap_count; ++index, ++it) {
+        const auto target_partition = prefix_byte_at(*it, byte_index);
+        const auto offset = partitions[target_partition].offset++;
+        std::swap(*it, begin[offset]);
+      }
+      return begin_offset != end_offset;
+    });
+  }
+
+  if (ska_is_last_level(byte_index, key_size)) {
+    return;
+  }
+  for (auto* it = remaining_partitions.data() + partition_count; it != remaining_partitions.data(); --it) {
+    const auto partition = it[-1];
+    const auto start_offset = (partition == 0) ? size_t{0} : partitions[partition - 1].next_offset;
+    const auto end_offset = partitions[partition].next_offset;
+    if (!ska_pdqsort_if_less_than_threshold(begin + start_offset, begin + end_offset, key_size)) {
+      ska_sort_partition(begin + start_offset, begin + end_offset, byte_index + 1, key_size);
     }
   }
 }
 
-void ska_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t key_size) {
-  ska_sort_recursive(begin, end, 0, key_size);
+// Sorts a partition whose rows share prefix bytes [0, byte_index).
+void ska_sort_partition(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t byte_index,
+                        const size_t key_size) {
+  if (byte_index >= std::min(sizeof(uint64_t), key_size)) {
+    // Prefix exhausted (only reached for keys longer than 8 bytes): order the ties by the key tail.
+    boost::sort::pdqsort(begin, end, [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
+      return lhs.less_than(rhs, key_size);
+    });
+    return;
+  }
+  if (static_cast<size_t>(end - begin) <= SKA_SORT_AMERICAN_FLAG_THRESHOLD) {
+    ska_american_flag_sort(begin, end, byte_index, key_size);
+  } else {
+    ska_byte_sort(begin, end, byte_index, key_size);
+  }
+}
+
+[[maybe_unused]] void ska_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t key_size) {
+  if (key_size == 0 || ska_pdqsort_if_less_than_threshold(begin, end, key_size)) {
+    return;
+  }
+  ska_sort_partition(begin, end, 0, key_size);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Vergesort (run generation). Port of the random-access version of Morwenn/vergesort, which DuckDB v1.4 uses as the
 // first stage of its thread-local sort. Vergesort hops through the input in steps of n / log2(n) rows and, at every
-// landing point, expands to both sides to find the ascending or descending run it landed in. Runs of at least
+// landing point, expands to both sides to find the non-descending or descending run it landed in. Runs of at least
 // n / log2(n) rows are kept (descending ones reversed); everything between them is sorted by `fallback`. Finally, all
-// sorted segments are merged pairwise. On random input, most probes fail after a few comparisons, so vergesort costs
-// roughly one fallback call plus O(log n) comparisons; on presorted input, it is linear.
+// sorted segments are merged pairwise with std::inplace_merge. On random input, most probes fail after a few
+// comparisons, so vergesort costs roughly one fallback call plus O(log n) comparisons; on presorted input, it is
+// linear.
 //
-// Deviations from upstream:
-//  1. Descending runs are detected strictly (b < a), not as non-ascending (!(a < b)). Equal keys are therefore never
-//     reversed, so vergesort is stable whenever the fallback is stable. Upstream reverses equal-key stretches.
-//  2. Segments are merged out of place with std::merge, alternating between the run and `scratch` (ping-pong), instead
-//     of std::inplace_merge, whose complexity depends on whether its internal buffer allocation succeeds.
-//  3. Two adjacent segments that are already in order are copied instead of merged.
-//  4. Segment bounds are kept in a std::vector instead of a std::list.
+// Follows upstream in: the probe/expand loop, the strictness of both run directions (a descending run continues while
+// !(a < b), so stretches of equal keys are reversed: unstable), pairwise std::inplace_merge over a std::list of run
+// ends, and the n < 128 cutoff.
+// Deviation: upstream hard-codes pdqsort for the unsorted parts and for n < 128; here both go to `fallback`, which is
+// how DuckDB plugs in ska sort (whose own small-size path is pdqsort, so the n < 128 case ends in pdqsort as upstream).
 //
-// `scratch` must have at least (last - first) rows. `fallback(begin, end, scratch_begin)` sorts [begin, end) and may
-// use scratch_begin as a buffer of (end - begin) rows.
+// `fallback(begin, end)` must sort [begin, end).
 // ---------------------------------------------------------------------------------------------------------------------
 template <typename Fallback>
-void vergesort(NormalizedKeyRow* first, NormalizedKeyRow* last, NormalizedKeyRow* scratch, const size_t key_size,
-               const Fallback& fallback) {
-  const auto row_count = static_cast<size_t>(last - first);
-  if (row_count < VERGESORT_MIN_SIZE) {
-    fallback(first, last, scratch);
+void vergesort(NormalizedKeyRow* first, NormalizedKeyRow* last, const size_t key_size, const Fallback& fallback) {
+  const auto dist = last - first;
+  if (dist < static_cast<std::ptrdiff_t>(VERGESORT_MIN_SIZE)) {
+    fallback(first, last);
     return;
   }
 
   const auto less = [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
     return lhs.less_than(rhs, key_size);
   };
-  const auto scratch_for = [&](const NormalizedKeyRow* position) {
-    return scratch + (position - first);
-  };
 
-  // A run is kept if it has at least n / log2(n) rows (upstream heuristic).
-  const auto min_run_size = static_cast<std::ptrdiff_t>(row_count / (std::bit_width(row_count) - 1));
+  // Limit under which the fallback is used to sort a sub-sequence (upstream: dist / log2(dist)).
+  const auto unstable_limit =
+      static_cast<std::ptrdiff_t>(dist / static_cast<std::ptrdiff_t>(std::bit_width(static_cast<size_t>(dist)) - 1));
 
-  // End of every sorted segment, in input order. Segment i spans [segment_ends[i - 1], segment_ends[i]), where the
-  // first segment starts at `first`.
-  auto segment_ends = std::vector<NormalizedKeyRow*>{};
-  // Start of the pending not-yet-sorted region, nullptr if there is none.
-  NormalizedKeyRow* begin_unsorted = nullptr;
+  // End of every sorted segment, in input order.
+  auto runs = std::list<NormalizedKeyRow*>{};
+
+  // Beginning of an unsorted partition, or `last` if there is none.
+  auto* begin_unstable = last;
 
   auto* current = first;
   auto* next = first + 1;
+
   while (true) {
+    // Beginning of the current sequence.
     auto* const begin_range = current;
 
-    // The remainder is too short to contain a run that we would keep: leave it to the fallback.
-    if (last - next <= min_run_size) {
-      if (!begin_unsorted) {
-        begin_unsorted = begin_range;
+    // If the rest of the input is not long enough to hold a run we would keep, treat it as unsorted.
+    if (last - next <= unstable_limit) {
+      if (begin_unstable == last) {
+        begin_unstable = begin_range;
       }
       break;
     }
 
-    // Hop ahead. The landing pair (current, next) decides the direction of the run we probe.
-    current += min_run_size;
-    next += min_run_size;
-    const auto descending = less(*next, *current);
-    const auto continues_run = [&](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
-      return descending ? less(rhs, lhs) : !less(rhs, lhs);
-    };
+    // Set backward iterators.
+    current += unstable_limit;
+    next += unstable_limit;
 
-    // Expand to the left, but not beyond the start of this probe.
-    auto* current_right = current;
-    auto* next_right = next;
-    do {
-      --current;
-      --next;
-      if (!continues_run(*current, *next)) {
-        break;
+    // Set forward iterators.
+    auto* current2 = current;
+    auto* next2 = next;
+
+    if (less(*next, *current)) {
+      // Found a decreasing sequence: move the iterators to the limits of the sequence.
+      do {
+        --current;
+        --next;
+        if (less(*current, *next)) {
+          break;
+        }
+      } while (current != begin_range);
+      if (less(*current, *next)) {
+        ++current;
       }
-    } while (current != begin_range);
-    if (!continues_run(*current, *next)) {
-      ++current;
+
+      ++current2;
+      ++next2;
+      while (next2 != last) {
+        if (less(*current2, *next2)) {
+          break;
+        }
+        ++current2;
+        ++next2;
+      }
+
+      // Check whether we found a big enough sorted sequence.
+      if (next2 - current >= unstable_limit) {
+        std::reverse(current, next2);
+        if (current != begin_range && begin_unstable == last) {
+          begin_unstable = begin_range;
+        }
+        if (begin_unstable != last) {
+          fallback(begin_unstable, current);
+          runs.push_back(current);
+          begin_unstable = last;
+        }
+        runs.push_back(next2);
+      } else if (begin_unstable == last) {
+        // Remember the beginning of the unsorted sequence.
+        begin_unstable = begin_range;
+      }
+    } else {
+      // Found an increasing sequence: move the iterators to the limits of the sequence.
+      do {
+        --current;
+        --next;
+        if (less(*next, *current)) {
+          break;
+        }
+      } while (current != begin_range);
+      if (less(*next, *current)) {
+        ++current;
+      }
+
+      ++current2;
+      ++next2;
+      while (next2 != last) {
+        if (less(*next2, *current2)) {
+          break;
+        }
+        ++current2;
+        ++next2;
+      }
+
+      // Check whether we found a big enough sorted sequence.
+      if (next2 - current >= unstable_limit) {
+        if (current != begin_range && begin_unstable == last) {
+          begin_unstable = begin_range;
+        }
+        if (begin_unstable != last) {
+          fallback(begin_unstable, current);
+          runs.push_back(current);
+          begin_unstable = last;
+        }
+        runs.push_back(next2);
+      } else if (begin_unstable == last) {
+        // Remember the beginning of the unsorted sequence.
+        begin_unstable = begin_range;
+      }
     }
 
-    // Expand to the right.
-    ++current_right;
-    ++next_right;
-    while (next_right != last && continues_run(*current_right, *next_right)) {
-      ++current_right;
-      ++next_right;
-    }
-
-    if (next_right - current >= min_run_size) {
-      // Keep [current, next_right) as a run. Sort the pending unsorted region in front of it, if any.
-      if (descending) {
-        std::reverse(current, next_right);
-      }
-      if (current != begin_range && !begin_unsorted) {
-        begin_unsorted = begin_range;
-      }
-      if (begin_unsorted) {
-        fallback(begin_unsorted, current, scratch_for(begin_unsorted));
-        segment_ends.push_back(current);
-        begin_unsorted = nullptr;
-      }
-      segment_ends.push_back(next_right);
-    } else if (!begin_unsorted) {
-      begin_unsorted = begin_range;
-    }
-
-    if (next_right == last) {
+    if (next2 == last) {
       break;
     }
-    current = next_right;
-    next = next_right + 1;
+
+    current = next2;
+    next = next2 + 1;
   }
 
-  if (begin_unsorted) {
-    fallback(begin_unsorted, last, scratch_for(begin_unsorted));
-    segment_ends.push_back(last);
+  if (begin_unstable != last) {
+    // If there are unsorted elements left, sort them.
+    runs.push_back(last);
+    fallback(begin_unstable, last);
   }
-  DebugAssert(!segment_ends.empty() && segment_ends.back() == last, "Sorted segments must cover the whole input.");
 
-  if (segment_ends.size() < 2) {
+  if (runs.size() < 2) {
     return;
   }
 
-  // Merge the segments pairwise, level by level, alternating between the input and the scratch buffer.
-  auto segment_bounds = std::vector<size_t>{0};
-  segment_bounds.reserve(segment_ends.size() + 1);
-  for (const auto* segment_end : segment_ends) {
-    segment_bounds.push_back(static_cast<size_t>(segment_end - first));
-  }
-
-  auto* source = first;
-  auto* target = scratch;
-  while (segment_bounds.size() > 2) {
-    const auto segment_count = segment_bounds.size() - 1;
-    auto merged_bounds = std::vector<size_t>{0};
-    merged_bounds.reserve((segment_count / 2) + 2);
-    for (auto segment = size_t{0}; segment < segment_count; segment += 2) {
-      const auto begin = segment_bounds[segment];
-      const auto middle = segment_bounds[segment + 1];
-      if (segment + 1 == segment_count) {
-        // Odd segment out: carry it over to the next level.
-        std::copy(source + begin, source + middle, target + begin);
-        merged_bounds.push_back(middle);
-        break;
-      }
-      const auto end = segment_bounds[segment + 2];
-      if (!less(source[middle], source[middle - 1])) {
-        std::copy(source + begin, source + end, target + begin);
-      } else {
-        // std::merge takes from the left range on ties, which keeps the merge stable.
-        std::merge(source + begin, source + middle, source + middle, source + end, target + begin, less);
-      }
-      merged_bounds.push_back(end);
+  // Merge runs pairwise until there is only one run left.
+  do {
+    auto* begin = first;
+    for (auto it = runs.begin(); it != runs.end() && it != std::prev(runs.end()); ++it) {
+      std::inplace_merge(begin, *it, *std::next(it), less);
+      // Remove the middle iterator and advance.
+      it = runs.erase(it);
+      begin = *it;
     }
-    segment_bounds = std::move(merged_bounds);
-    std::swap(source, target);
-  }
-
-  if (source != first) {
-    std::copy(source, source + row_count, first);
-  }
+  } while (runs.size() > 1);
 }
+
+// END_SORT_KERNELS (marker for standalone kernel tests)
 
 /**
  * Merge k sorted runs of NormalizedKeyRows into a single RowIDPosList using a loser tree.
@@ -814,12 +973,12 @@ std::vector<size_t> compute_intersections(
   return intersections;
 }
 
-// Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine instead
-// of the input size (a fixed partition size makes the partition count a function of the row count, which leaves
-// workers idle on small inputs and produces a ragged final wave on medium ones). Falls back to a single partition when
-// no worker-based scheduler is set, which keeps the merge correct and serial. Never exceeds row_count, so every
-// partition emits at least one row.
-size_t determine_merge_partition_count(const size_t row_count) {
+// Number of active workers of the scheduler. Used both as the number of sorted runs (one per worker, as DuckDB
+// generates one thread-local sorted run per thread) and as the number of merge-path partitions (so that the merge's
+// parallelism follows the machine instead of the input size). Falls back to 1 when no worker-based scheduler is set,
+// i.e., single-threaded execution produces one run and needs no merge. Never exceeds row_count, so every run and every
+// partition holds at least one row.
+size_t determine_worker_count(const size_t row_count) {
   auto worker_count = size_t{1};
   if (const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(Hyrise::get().scheduler())) {
     worker_count = static_cast<size_t>(node_queue_scheduler->active_worker_count());
@@ -1326,8 +1485,8 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto padded_key_size = ((normalized_key_size + 3) / 4) * 4;
 
-  // const auto scan_time = timer.lap();
-  timer.lap();
+  // No lap here: the column scan above (encoding widths, nullability, long strings) and the key encoding below are
+  // both charged to OperatorSteps::KeyMaterialization.
 
   // Convert the columnar layout into a row layout for better sorting. This is done by encoding all sorted columns
   // into an array of bytes. These rows can be compared using memcmp.
@@ -1392,36 +1551,48 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   }
   Hyrise::get().scheduler()->schedule_and_wait_for_tasks(materialization_tasks);
 
-  const auto materialization_time = timer.lap();
+  const auto key_materialization_time = timer.lap();
 
-  // Scratch buffer for run generation: used by the radix sort and by vergesort's run merging (the k-way merge
-  // allocates its own buffers). Pdqsort and ska sort are in place.
-  constexpr auto RUN_GENERATION_NEEDS_SCRATCH = RUN_GENERATION != RunGenerationAlgorithm::Pdqsort;
-  auto sort_scratch =
-      uninitialized_vector<NormalizedKeyRow>(RUN_GENERATION_NEEDS_SCRATCH ? input_table->row_count() : size_t{0});
+  // Run generation (sink phase): one sorted run per active worker, as DuckDB generates one thread-local sorted run per
+  // thread. Materialization above is still chunk-parallel; the materialized row array is contiguous across chunks, so
+  // a run is simply the worker's contiguous slice [run_offsets[r], run_offsets[r + 1]) and need not align with chunk
+  // boundaries (each row carries its own key pointer). With a single worker (e.g., no NodeQueueScheduler), there is
+  // exactly one run and the merge degenerates to extracting the RowIDs.
+  const auto row_count = materialized_rows.size();
+  const auto worker_count = determine_worker_count(row_count);
+  const auto run_count = worker_count;
+  auto run_offsets = std::vector<size_t>(run_count + 1);
+  for (auto run_index = size_t{0}; run_index <= run_count; ++run_index) {
+    run_offsets[run_index] = row_count * run_index / run_count;
+  }
 
-  // Sort each chunk's slice of the materialized rows independently and in parallel. Every chunk becomes a sorted run
-  // for the subsequent merge (run generation / sink phase). The algorithm is selected via RUN_GENERATION.
+  // Scratch buffer for run generation, only needed by the out-of-place radix sort. Pdqsort, ska sort, and vergesort
+  // (std::inplace_merge, which allocates its own buffer) do not use it.
+  constexpr auto RUN_GENERATION_NEEDS_SCRATCH =
+      RUN_GENERATION == RunGenerationAlgorithm::Radix ||
+      (RUN_GENERATION == RunGenerationAlgorithm::Vergesort && VERGESORT_FALLBACK == VergesortFallback::Radix);
+  auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(RUN_GENERATION_NEEDS_SCRATCH ? row_count : size_t{0});
+
+  // Sort each worker's slice independently and in parallel, one task per run. The algorithm is selected via
+  // RUN_GENERATION.
   auto sort_run_tasks = std::vector<std::shared_ptr<AbstractTask>>();
-  sort_run_tasks.reserve(chunk_count);
-  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
+  sort_run_tasks.reserve(run_count);
+  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
     sort_run_tasks.emplace_back(std::make_shared<JobTask>([&, run_index]() {
-      auto* run_begin = materialized_rows.data() + chunk_offsets[run_index];
-      auto* run_end = materialized_rows.data() + chunk_offsets[run_index + 1];
+      auto* run_begin = materialized_rows.data() + run_offsets[run_index];
+      auto* run_end = materialized_rows.data() + run_offsets[run_index + 1];
+      auto* run_scratch = sort_scratch.data() + (RUN_GENERATION_NEEDS_SCRATCH ? run_offsets[run_index] : size_t{0});
       if constexpr (RUN_GENERATION == RunGenerationAlgorithm::Radix) {
-        auto* run_scratch = sort_scratch.data() + chunk_offsets[run_index];
         radix_sort(run_begin, run_end, run_scratch, normalized_key_size);
       } else if constexpr (RUN_GENERATION == RunGenerationAlgorithm::Vergesort) {
-        auto* run_scratch = sort_scratch.data() + chunk_offsets[run_index];
-        const auto fallback = [normalized_key_size](NormalizedKeyRow* begin, NormalizedKeyRow* end,
-                                                    [[maybe_unused]] NormalizedKeyRow* scratch) {
+        const auto fallback = [&](NormalizedKeyRow* begin, NormalizedKeyRow* end) {
           if constexpr (VERGESORT_FALLBACK == VergesortFallback::SkaSort) {
             ska_sort(begin, end, normalized_key_size);
           } else {
-            radix_sort(begin, end, scratch, normalized_key_size);
+            radix_sort(begin, end, run_scratch + (begin - run_begin), normalized_key_size);
           }
         };
-        vergesort(run_begin, run_end, run_scratch, normalized_key_size, fallback);
+        vergesort(run_begin, run_end, normalized_key_size, fallback);
       } else {
         boost::sort::pdqsort(run_begin, run_end,
                              [normalized_key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
@@ -1434,34 +1605,35 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto sort_time = timer.lap();
 
-  // Merge the k sorted runs (k = chunk count) into the final position list.
+  // Merge the k sorted runs (k = worker count) into the final position list.
   auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
-  runs.reserve(chunk_count);
-  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
-    runs.emplace_back(materialized_rows.data() + chunk_offsets[run_index],
-                      materialized_rows.data() + chunk_offsets[run_index + 1]);
+  runs.reserve(run_count);
+  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
+    runs.emplace_back(materialized_rows.data() + run_offsets[run_index],
+                      materialized_rows.data() + run_offsets[run_index + 1]);
   }
 
   // Merge path: one partition per active worker, computed as its own phase so that the cost of finding the
   // boundaries is reported separately from the cost of merging.
-  const auto merge_partition_count = determine_merge_partition_count(materialized_rows.size());
+  const auto merge_partition_count = worker_count;
   const auto merge_path_boundaries =
-      compute_merge_path_boundaries(runs, normalized_key_size, materialized_rows.size(), merge_partition_count);
+      compute_merge_path_boundaries(runs, normalized_key_size, row_count, merge_partition_count);
 
   const auto merge_path_time = timer.lap();
 
-  auto position_list =
-      merge_partitions(runs, normalized_key_size, materialized_rows.size(), merge_path_boundaries);
+  auto position_list = merge_partitions(runs, normalized_key_size, row_count, merge_path_boundaries);
 
   const auto merge_time = timer.lap();
 
-  // Note: Sort covers the parallel run generation, MergePath the computation of the merge-path partition boundaries,
-  // and TemporaryResultWriting the merge itself (which also writes the temporary result, i.e., the position list).
+  // Steps: KeyMaterialization covers the column scan that fixes the key layout (widths, nullability, long strings) and
+  // the encoding of the normalized keys into the row array, Sort the parallel run generation, MergePath the
+  // computation of the merge-path partition boundaries, and MergeTime the merge itself (which also writes the position
+  // list). ResultMaterialization is set below.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
-  step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
+  step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, key_materialization_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, merge_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
@@ -1512,7 +1684,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     output_chunk->set_individually_sorted_by(final_sort_definition);
   }
 
-  step_performance_data.set_step_runtime(OperatorSteps::WriteOutput, timer.lap());
+  step_performance_data.set_step_runtime(OperatorSteps::ResultMaterialization, timer.lap());
   return sorted_table;
 }
 
