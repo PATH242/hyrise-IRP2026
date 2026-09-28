@@ -1,16 +1,11 @@
 #pragma once
 
-#include <algorithm>
-#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "abstract_read_only_operator.hpp"
-#include "resolve_type.hpp"
-#include "storage/create_iterable_from_segment.hpp"
 #include "types.hpp"
 
 namespace hyrise {
@@ -24,8 +19,13 @@ class Sort : public AbstractReadOnlyOperator {
  public:
   enum class ForceMaterialization : bool { Yes = true, No = false };
 
-  enum class OperatorSteps : uint8_t { MaterializeSortColumns, Sort, TemporaryResultWriting, WriteOutput };
-
+  enum class OperatorSteps : uint8_t {
+    Sort,
+    MergeTime,
+    MergePath,
+    KeyMaterialization,
+    ResultMaterialization
+  };
   Sort(const std::shared_ptr<const AbstractOperator>& input_operator,
        const std::vector<SortColumnDefinition>& sort_definitions,
        const ChunkOffset output_chunk_size = Chunk::DEFAULT_SIZE,

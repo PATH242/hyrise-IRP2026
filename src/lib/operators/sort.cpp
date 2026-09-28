@@ -5,12 +5,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <boost/sort/pdqsort/pdqsort.hpp>
 
 #include "all_type_variant.hpp"
 #include "operators/abstract_operator.hpp"
@@ -22,6 +27,7 @@
 #include "storage/chunk.hpp"
 #include "storage/pos_lists/row_id_pos_list.hpp"
 #include "storage/reference_segment.hpp"
+#include "storage/segment_accessor.hpp"
 #include "storage/segment_iterate.hpp"
 #include "storage/table.hpp"
 #include "storage/value_segment.hpp"
@@ -29,123 +35,300 @@
 #include "utils/assert.hpp"
 #include "utils/timer.hpp"
 
+/**
+ * Subsort: column-at-a-time sort with tie resolution, single-threaded.
+ *
+ * This is the subsort approach of Kuiper & Muehleisen, "These Rows Are Made for Sorting and That's Just What We'll
+ * Do" (ICDE 2023), Section IV, applied to a columnar source: sort everything by the first key column, identify the
+ * tuples that are tied in that column, sort those by the second key column, and repeat until no ties remain or all
+ * key columns are done. As in the paper's columnar variant, rows are represented by their RowID and the values of
+ * one key column at a time, so each pass causes random access in a single column and the comparison function has no
+ * branches for further columns.
+ *
+ * The first sort column is materialized as (RowID, is_null, value) tuples and sorted with pdqsort; every tie run is
+ * then sorted by the next sort column, whose values are fetched only for the rows of that run.
+ *
+ * There is no parallelism anywhere in this operator: no tasks, no scheduler, no k-way merge. The MergeTime and
+ * MergePath steps therefore stay unset (they read back as 0), and SORT_US covers the first-column sort plus all tie
+ * resolution.
+ *
+ * Derived from the subsort in hyrise/dyod2025_group1717 (src/lib/operators/sort.cpp). Changes relative to it:
+ *   B1  NULLs in a subsorted column formed no tie run, so rows NULL in column k were never ordered by column k + 1.
+ *   B2  With nulls last, the final tie run of a subsorted column extended over the trailing NULLs.
+ *   B3  The first-column tie scan compared the placeholder value of NULLs (T{}), merging NULLs into an adjacent run
+ *       of T{} (e.g., 0 or "") when nulls sort last.
+ *   B4  The first element of each scan was counted twice, so singleton ranges were subsorted (harmless, wasted work).
+ *   -   Comparators are functors dispatched once per sort instead of std::function calls per comparison, which is
+ *       the static- vs. dynamic-comparator difference measured in Section V-B of the paper.
+ *   -   All task scheduling removed (materialization, tie resolution, and output writing are plain loops).
+ * B1-B3 only affect NULLs; without NULLs the reference and this implementation produce equally valid orders.
+ *
+ * Neither variant is stable: rows that tie on all sort columns may appear in any order.
+ */
+
 namespace {
 
-using namespace hyrise;
+using namespace hyrise;  // NOLINT(build/namespaces)
 
-// Ceiling of integer division
-size_t div_ceil(const size_t lhs, const ChunkOffset rhs) {
-  DebugAssert(rhs > 0, "Divisor must be larger than 0.");
-  return (lhs + rhs - 1) / rhs;
+// ==== BEGIN SUBSORT CORE ============================================================================================
+// Everything between the BEGIN/END markers is Hyrise-independent (it only needs RowID, SortMode, Fail and boost
+// pdqsort). The standalone fuzz harness extracts exactly this block and compiles it against minimal shims, so the
+// tested code is this code. Nothing in here spawns tasks or threads.
+
+// Tuple comparator on (id, is_null, value) tuples. Replaces the std::function-based get_comparator() of the
+// reference: the sort mode is dispatched once per sort instead of once per comparison, which is the static- vs.
+// dynamic-comparator effect measured in Section V-B of Kuiper & Muehleisen (ICDE 2023).
+template <bool ASCENDING, bool NULLS_FIRST>
+struct TupleLess {
+  template <typename Tuple>
+  bool operator()(const Tuple& lhs, const Tuple& rhs) const {
+    const auto lhs_is_null = std::get<1>(lhs);
+    const auto rhs_is_null = std::get<1>(rhs);
+    if (lhs_is_null || rhs_is_null) {
+      return NULLS_FIRST ? (lhs_is_null && !rhs_is_null) : (!lhs_is_null && rhs_is_null);
+    }
+    if constexpr (ASCENDING) {
+      return std::get<2>(lhs) < std::get<2>(rhs);
+    } else {
+      return std::get<2>(rhs) < std::get<2>(lhs);
+    }
+  }
+};
+
+template <typename Functor>
+void with_comparator(const SortMode sort_mode, Functor&& functor) {
+  switch (sort_mode) {
+    case SortMode::AscendingNullsFirst:
+      functor(TupleLess<true, true>{});
+      return;
+    case SortMode::AscendingNullsLast:
+      functor(TupleLess<true, false>{});
+      return;
+    case SortMode::DescendingNullsFirst:
+      functor(TupleLess<false, true>{});
+      return;
+    case SortMode::DescendingNullsLast:
+      functor(TupleLess<false, false>{});
+      return;
+  }
+  Fail("Unsupported sort mode.");
 }
+
+// Two tuples tie on the current column iff both are NULL or both are non-NULL with equal values. The NULL check
+// comes first: the value slot of a NULL is a placeholder (T{}) and must not be compared (fixes B3 of the reference).
+template <typename Tuple>
+bool same_key(const Tuple& lhs, const Tuple& rhs) {
+  const auto lhs_is_null = std::get<1>(lhs);
+  if (lhs_is_null != std::get<1>(rhs)) {
+    return false;
+  }
+  return lhs_is_null || std::get<2>(lhs) == std::get<2>(rhs);
+}
+
+// Calls on_run(run_begin, run_end) for every maximal range of length > 1 with equal keys in the sorted range
+// [begin, end) -- the "identify the tuples that have an equal value in this column" step of the subsort approach.
+// NULLs form a tie run like any other value (fixes B1/B2); singleton ranges are never reported (B4).
+template <typename Iterator, typename OnRun>
+void for_each_tie_run(const Iterator begin, const Iterator end, OnRun&& on_run) {
+  auto run_begin = begin;
+  while (run_begin != end) {
+    auto run_end = std::next(run_begin);
+    while (run_end != end && same_key(*run_begin, *run_end)) {
+      ++run_end;
+    }
+    if (std::distance(run_begin, run_end) > 1) {
+      on_run(run_begin, run_end);
+    }
+    run_begin = run_end;
+  }
+}
+
+// ---- Subsort (column-at-a-time tie resolution, Section IV of Kuiper & Muehleisen) ----------------------------------
+//
+// `Source` abstracts the table: column_count(), sort_mode(k), and visit(k, f), which calls f(fetch) with a callable
+// fetch(RowID) -> std::optional<T> for sort column k.
+
+// Sorts the rows in [begin, end), which tie on sort columns 0 .. column_offset - 1, by sort column column_offset and
+// recurses into the ties of that column. Only the values of the rows in this range are read, so later key columns
+// are only ever touched for rows that tie on all previous ones.
+template <typename Row, typename Source>
+void subsort_range(Row* begin, Row* end, const size_t column_offset, const Source& source) {
+  source.visit(column_offset, [&](auto&& fetch) {
+    using OptionalValue = std::decay_t<decltype(fetch(std::get<0>(*begin)))>;
+    using T = typename OptionalValue::value_type;
+
+    const auto range_length = static_cast<size_t>(end - begin);
+    auto values = std::vector<std::tuple<size_t, bool, T>>{};
+    values.reserve(range_length);
+    for (auto offset = size_t{0}; offset < range_length; ++offset) {
+      auto value = fetch(std::get<0>(begin[offset]));
+      if (value) {
+        values.emplace_back(offset, false, std::move(*value));
+      } else {
+        values.emplace_back(offset, true, T{});
+      }
+    }
+
+    with_comparator(source.sort_mode(column_offset), [&](const auto less) {
+      boost::sort::pdqsort(values.begin(), values.end(), less);
+    });
+
+    // Apply the permutation to the first-column rows.
+    auto rows = std::vector<Row>(std::make_move_iterator(begin), std::make_move_iterator(end));
+    for (auto offset = size_t{0}; offset < range_length; ++offset) {
+      begin[offset] = std::move(rows[std::get<0>(values[offset])]);
+    }
+
+    if (column_offset + 1 == source.column_count()) {
+      return;
+    }
+
+    for_each_tie_run(values.begin(), values.end(), [&](const auto run_begin, const auto run_end) {
+      subsort_range(begin + (run_begin - values.begin()), begin + (run_end - values.begin()), column_offset + 1,
+                    source);
+    });
+  });
+}
+
+// Sorts the materialized first sort column and resolves all its ties. Single-threaded throughout.
+struct SubsortTimings {
+  std::chrono::nanoseconds first_column_sort{};
+  std::chrono::nanoseconds sub_sort{};
+};
+
+template <typename Row, typename Source>
+void subsort_sort(std::vector<Row>& rows, const Source& source, SubsortTimings& timings) {
+  const auto clock_start = std::chrono::steady_clock::now();
+  with_comparator(source.sort_mode(0), [&](const auto less) {
+    boost::sort::pdqsort(rows.begin(), rows.end(), less);
+  });
+  const auto clock_sorted = std::chrono::steady_clock::now();
+
+  if (source.column_count() > 1 && !rows.empty()) {
+    for_each_tie_run(rows.begin(), rows.end(), [&](const auto run_begin, const auto run_end) {
+      auto* range_begin = &*run_begin;
+      subsort_range(range_begin, range_begin + (run_end - run_begin), 1, source);
+    });
+  }
+
+  timings.first_column_sort = clock_sorted - clock_start;
+  timings.sub_sort = std::chrono::steady_clock::now() - clock_sorted;
+}
+// ==== END SUBSORT CORE ==============================================================================================
+
+// Ceiling of integer division.
+size_t div_ceil(const auto lhs, const auto rhs) {
+  DebugAssert(rhs > 0, "Divisor must be larger than 0.");
+  return (lhs + rhs - 1u) / rhs;
+}
+
+// Table access for subsort_range(): sort column k of `table`, fetched through per-visit segment accessors.
+struct TableColumnSource {
+  const Table& table;
+  const std::vector<SortColumnDefinition>& sort_definitions;
+
+  size_t column_count() const {
+    return sort_definitions.size();
+  }
+
+  SortMode sort_mode(const size_t sort_column_offset) const {
+    return sort_definitions[sort_column_offset].sort_mode;
+  }
+
+  template <typename Functor>
+  void visit(const size_t sort_column_offset, Functor&& functor) const {
+    const auto column_id = sort_definitions[sort_column_offset].column;
+    resolve_data_type(table.column_data_type(column_id), [&](auto type) {
+      using ColumnDataType = typename decltype(type)::type;
+
+      auto accessor_by_chunk_id = std::unordered_map<ChunkID, std::unique_ptr<AbstractSegmentAccessor<ColumnDataType>>>{};
+      const auto fetch = [&](const RowID& row_id) -> std::optional<ColumnDataType> {
+        auto iter = accessor_by_chunk_id.find(row_id.chunk_id);
+        if (iter == accessor_by_chunk_id.end()) {
+          const auto& segment = table.get_chunk(row_id.chunk_id)->get_segment(column_id);
+          iter = accessor_by_chunk_id.emplace(row_id.chunk_id, create_segment_accessor<ColumnDataType>(segment)).first;
+        }
+        return iter->second->access(row_id.chunk_offset);
+      };
+      functor(fetch);
+    });
+  }
+};
 
 // Given an unsorted_table and a pos_list that defines the output order, this materializes all columns in the table,
 // creating chunks of output_chunk_size rows at maximum.
 std::shared_ptr<Table> write_materialized_output_table(const std::shared_ptr<const Table>& unsorted_table,
-                                                       RowIDPosList pos_list, const ChunkOffset output_chunk_size) {
-  // First, we create a new table as the output
+                                                       std::vector<RowIDPosList> pos_lists,
+                                                       const ChunkOffset output_chunk_size) {
   // We have decided against duplicating MVCC data in https://github.com/hyrise/hyrise/issues/408
   auto output = std::make_shared<Table>(unsorted_table->column_definitions(), TableType::Data, output_chunk_size);
 
-  // After we created the output table and initialized the column structure, we can start adding values. Because the
-  // values are not sorted by input chunks anymore, we can't process them chunk by chunk. Instead the values are copied
-  // column by column for each output row.
-
-  const auto output_chunk_count = div_ceil(pos_list.size(), output_chunk_size);
-  Assert(pos_list.size() == unsorted_table->row_count(), "Mismatching size of input table and PosList");
-
-  // Vector of segments for each chunk
-  auto output_segments_by_chunk = std::vector<Segments>{output_chunk_count};
-
-  // Materialize column by column, starting a new ValueSegment whenever output_chunk_size is reached
-  const auto input_chunk_count = unsorted_table->chunk_count();
+  auto output_segments_by_chunk = std::vector<Segments>(pos_lists.size());
   const auto output_column_count = unsorted_table->column_count();
-  const auto row_count = unsorted_table->row_count();
-  for (auto column_id = ColumnID{0}; column_id < output_column_count; ++column_id) {
-    const auto column_data_type = output->column_data_type(column_id);
-    const auto column_is_nullable = unsorted_table->column_is_nullable(column_id);
 
-    resolve_data_type(column_data_type, [&](auto type) {
-      using ColumnDataType = typename decltype(type)::type;
+  const auto pos_list_count = pos_lists.size();
+  for (auto pos_list_index = size_t{0}; pos_list_index < pos_list_count; ++pos_list_index) {
+    {
+      const auto& pos_list = pos_lists[pos_list_index];
+      const auto row_count = pos_list.size();
+      for (auto column_id = ColumnID{0}; column_id < output_column_count; ++column_id) {
+        const auto column_data_type = output->column_data_type(column_id);
+        const auto column_is_nullable = unsorted_table->column_is_nullable(column_id);
 
-      auto chunk_it = output_segments_by_chunk.begin();
-      auto current_segment_size = size_t{0};
+        resolve_data_type(column_data_type, [&](auto type) {
+          using ColumnDataType = typename decltype(type)::type;
 
-      auto value_segment_value_vector = pmr_vector<ColumnDataType>{};
-      auto value_segment_null_vector = pmr_vector<bool>{};
+          auto& chunk_it = output_segments_by_chunk[pos_list_index];
 
-      {
-        const auto next_chunk_size = std::min(static_cast<size_t>(output_chunk_size), static_cast<size_t>(row_count));
-        value_segment_value_vector.reserve(next_chunk_size);
-        if (column_is_nullable) {
-          value_segment_null_vector.reserve(next_chunk_size);
-        }
-      }
+          auto value_segment_value_vector = pmr_vector<ColumnDataType>{};
+          auto value_segment_null_vector = pmr_vector<bool>{};
 
-      auto accessor_by_chunk_id =
-          std::vector<std::unique_ptr<AbstractSegmentAccessor<ColumnDataType>>>(unsorted_table->chunk_count());
-      for (auto input_chunk_id = ChunkID{0}; input_chunk_id < input_chunk_count; ++input_chunk_id) {
-        const auto& abstract_segment = unsorted_table->get_chunk(input_chunk_id)->get_segment(column_id);
-        accessor_by_chunk_id[input_chunk_id] = create_segment_accessor<ColumnDataType>(abstract_segment);
-      }
+          value_segment_value_vector.reserve(row_count);
+          if (column_is_nullable) {
+            value_segment_null_vector.reserve(row_count);
+          }
 
-      for (auto row_index = size_t{0}; row_index < row_count; ++row_index) {
-        const auto [chunk_id, chunk_offset] = pos_list[row_index];
+          auto accessor_by_chunk_id =
+              std::unordered_map<ChunkID, std::unique_ptr<AbstractSegmentAccessor<ColumnDataType>>>();
+          for (auto row_index = size_t{0}; row_index < row_count; ++row_index) {
+            const auto [chunk_id, chunk_offset] = pos_list[row_index];
 
-        auto& accessor = accessor_by_chunk_id[chunk_id];
-        const auto typed_value = accessor->access(chunk_offset);
-        const auto is_null = !typed_value;
-        value_segment_value_vector.push_back(is_null ? ColumnDataType{} : typed_value.value());
-        if (column_is_nullable) {
-          value_segment_null_vector.push_back(is_null);
-        }
+            auto iter = accessor_by_chunk_id.find(chunk_id);
+            if (iter == accessor_by_chunk_id.end()) {
+              const auto& abstract_segment = unsorted_table->get_chunk(chunk_id)->get_segment(column_id);
+              auto iter_and_inserted =
+                  accessor_by_chunk_id.emplace(chunk_id, create_segment_accessor<ColumnDataType>(abstract_segment));
+              DebugAssert(iter_and_inserted.second, "Unexpected non-insert.");
+              iter = iter_and_inserted.first;
+            }
 
-        ++current_segment_size;
+            auto& accessor = iter->second;
+            const auto typed_value = accessor->access(chunk_offset);
+            const auto is_null = !typed_value;
+            value_segment_value_vector.push_back(is_null ? ColumnDataType{} : typed_value.value());
+            if (column_is_nullable) {
+              value_segment_null_vector.push_back(is_null);
+            }
+          }
 
-        // Check if value segment is full
-        if (current_segment_size >= output_chunk_size) {
-          current_segment_size = 0;
-
-          std::shared_ptr<ValueSegment<ColumnDataType>> value_segment;
+          auto value_segment = std::shared_ptr<ValueSegment<ColumnDataType>>{};
           if (column_is_nullable) {
             value_segment = std::make_shared<ValueSegment<ColumnDataType>>(std::move(value_segment_value_vector),
                                                                            std::move(value_segment_null_vector));
           } else {
             value_segment = std::make_shared<ValueSegment<ColumnDataType>>(std::move(value_segment_value_vector));
           }
-
-          chunk_it->push_back(value_segment);
-          value_segment_value_vector = pmr_vector<ColumnDataType>{};
-          value_segment_null_vector = pmr_vector<bool>{};
-
-          const auto next_chunk_size =
-              std::min(static_cast<size_t>(output_chunk_size), static_cast<size_t>(row_count - row_index));
-          value_segment_value_vector.reserve(next_chunk_size);
-          if (column_is_nullable) {
-            value_segment_null_vector.reserve(next_chunk_size);
-          }
-
-          ++chunk_it;
-        }
+          chunk_it.push_back(value_segment);
+        });
       }
-
-      // Last segment has not been added
-      if (current_segment_size > 0) {
-        std::shared_ptr<ValueSegment<ColumnDataType>> value_segment;
-        if (column_is_nullable) {
-          value_segment = std::make_shared<ValueSegment<ColumnDataType>>(std::move(value_segment_value_vector),
-                                                                         std::move(value_segment_null_vector));
-        } else {
-          value_segment = std::make_shared<ValueSegment<ColumnDataType>>(std::move(value_segment_value_vector));
-        }
-        chunk_it->push_back(value_segment);
-      }
-    });
+    }
   }
 
   for (auto& segments : output_segments_by_chunk) {
     output->append_chunk(segments);
   }
+
+  Assert(output->row_count() == unsorted_table->row_count(), "Mismatching size of input and output table.");
 
   return output;
 }
@@ -159,70 +342,46 @@ std::shared_ptr<Table> write_materialized_output_table(const std::shared_ptr<con
 // If unsorted_table is of TableType::Data, this is trivial and the input_pos_list is used to create the output
 // reference table. If the input is already a reference table, the double indirection needs to be resolved.
 std::shared_ptr<Table> write_reference_output_table(const std::shared_ptr<const Table>& unsorted_table,
-                                                    RowIDPosList input_pos_list, const ChunkOffset output_chunk_size) {
-  // First we create a new table as the output
+                                                    std::vector<RowIDPosList> input_pos_lists,
+                                                    const ChunkOffset /*output_chunk_size*/) {
   // We have decided against duplicating MVCC data in https://github.com/hyrise/hyrise/issues/408
   auto output_table = std::make_shared<Table>(unsorted_table->column_definitions(), TableType::References);
 
   const auto resolve_indirection = unsorted_table->type() == TableType::References;
   const auto column_count = output_table->column_count();
 
-  const auto output_chunk_count = div_ceil(input_pos_list.size(), output_chunk_size);
-  Assert(input_pos_list.size() == unsorted_table->row_count(), "Mismatching size of input table and PosList");
+  auto output_segments_by_chunk = std::vector<Segments>(input_pos_lists.size(), Segments(column_count));
 
-  // Vector of segments for each chunk
-  auto output_segments_by_chunk = std::vector<Segments>(output_chunk_count, Segments(column_count));
-
-  if (!resolve_indirection && input_pos_list.size() <= output_chunk_size) {
-    // Shortcut: No need to copy RowIDs if input_pos_list is small enough and we do not need to resolve the indirection.
-    const auto output_pos_list = std::make_shared<RowIDPosList>(std::move(input_pos_list));
-    auto& output_segments = output_segments_by_chunk.at(0);
-    for (auto column_id = ColumnID{0}; column_id < column_count; ++column_id) {
-      output_segments[column_id] = std::make_shared<ReferenceSegment>(unsorted_table, column_id, output_pos_list);
-    }
-  } else {
-    for (auto column_id = ColumnID{0}; column_id < column_count; ++column_id) {
-      // To keep the implementation simple, we write the output ReferenceSegments column by column. This means that even
-      // if input ReferenceSegments share a PosList, the output will contain independent PosLists. While this is
-      // slightly more expensive to generate and slightly less efficient for following operators, we assume that the
-      // lion's share of the work has been done before the Sort operator is executed and that the relative cost of this
-      // is acceptable. In the future, this could be improved.
-      auto output_pos_list = std::make_shared<RowIDPosList>();
-      output_pos_list->reserve(output_chunk_size);
-
-      // Collect all input segments for the current column
-      const auto input_chunk_count = unsorted_table->chunk_count();
-      auto input_segments = std::vector<std::shared_ptr<AbstractSegment>>(input_chunk_count);
-      for (auto input_chunk_id = ChunkID{0}; input_chunk_id < input_chunk_count; ++input_chunk_id) {
-        input_segments[input_chunk_id] = unsorted_table->get_chunk(input_chunk_id)->get_segment(column_id);
+  const auto pos_list_count = input_pos_lists.size();
+  for (auto pos_list_index = size_t{0}; pos_list_index < pos_list_count; ++pos_list_index) {
+    {
+      auto& input_pos_list = input_pos_lists[pos_list_index];
+      auto& output_segments = output_segments_by_chunk[pos_list_index];
+      if (!resolve_indirection) {
+        const auto output_pos_list = std::make_shared<RowIDPosList>(std::move(input_pos_list));
+        for (auto column_id = ColumnID{0}; column_id < column_count; ++column_id) {
+          output_segments[column_id] = std::make_shared<ReferenceSegment>(unsorted_table, column_id, output_pos_list);
+        }
+        continue;
       }
 
-      const auto first_reference_segment = std::dynamic_pointer_cast<ReferenceSegment>(input_segments.at(0));
-      const auto referenced_table = resolve_indirection ? first_reference_segment->referenced_table() : unsorted_table;
-      const auto referenced_column_id =
-          resolve_indirection ? first_reference_segment->referenced_column_id() : column_id;
+      for (auto column_id = ColumnID{0}; column_id < column_count; ++column_id) {
+        // To keep the implementation simple, we write the output ReferenceSegments column by column. This means that
+        // even if input ReferenceSegments share a PosList, the output will contain independent PosLists.
+        auto output_pos_list = std::make_shared<RowIDPosList>();
+        output_pos_list->reserve(input_pos_list.size());
 
-      // write_output_pos_list creates an output reference segment for a given ChunkID, ColumnID and PosList.
-      auto output_chunk_id = ChunkID{0};
-      const auto write_output_pos_list = [&] {
-        DebugAssert(!output_pos_list->empty(), "Asked to write empty output_pos_list");
-        output_segments_by_chunk.at(output_chunk_id)[column_id] =
-            std::make_shared<ReferenceSegment>(referenced_table, referenced_column_id, output_pos_list);
-        ++output_chunk_id;
-
-        output_pos_list = std::make_shared<RowIDPosList>();
-        if (output_chunk_id < output_chunk_count) {
-          output_pos_list->reserve(output_chunk_size);
+        const auto input_chunk_count = unsorted_table->chunk_count();
+        auto input_segments = std::vector<std::shared_ptr<AbstractSegment>>(input_chunk_count);
+        for (auto input_chunk_id = ChunkID{0}; input_chunk_id < input_chunk_count; ++input_chunk_id) {
+          input_segments[input_chunk_id] = unsorted_table->get_chunk(input_chunk_id)->get_segment(column_id);
         }
-      };
 
-      // Iterate over rows in sorted input pos list, dereference them if necessary, and write a chunk every
-      // `output_chunk_size` rows.
-      const auto input_pos_list_size = input_pos_list.size();
-      for (auto input_pos_list_offset = size_t{0}; input_pos_list_offset < input_pos_list_size;
-           ++input_pos_list_offset) {
-        const auto& row_id = input_pos_list[input_pos_list_offset];
-        if (resolve_indirection) {
+        const auto first_reference_segment = std::dynamic_pointer_cast<ReferenceSegment>(input_segments.at(0));
+        const auto referenced_table = first_reference_segment->referenced_table();
+        const auto referenced_column_id = first_reference_segment->referenced_column_id();
+
+        for (const auto& row_id : input_pos_list) {
           const auto& input_reference_segment = static_cast<ReferenceSegment&>(*input_segments[row_id.chunk_id]);
           DebugAssert(input_reference_segment.referenced_table() == referenced_table,
                       "Input column references more than one table");
@@ -230,16 +389,11 @@ std::shared_ptr<Table> write_reference_output_table(const std::shared_ptr<const 
                       "Input column references more than one column");
           const auto& input_reference_pos_list = input_reference_segment.pos_list();
           output_pos_list->emplace_back((*input_reference_pos_list)[row_id.chunk_offset]);
-        } else {
-          output_pos_list->emplace_back(row_id);
         }
 
-        if (output_pos_list->size() == output_chunk_size) {
-          write_output_pos_list();
-        }
-      }
-      if (!output_pos_list->empty()) {
-        write_output_pos_list();
+        DebugAssert(!output_pos_list->empty(), "Asked to write empty output_pos_list.");
+        output_segments[column_id] =
+            std::make_shared<ReferenceSegment>(referenced_table, referenced_column_id, output_pos_list);
       }
     }
   }
@@ -248,12 +402,92 @@ std::shared_ptr<Table> write_reference_output_table(const std::shared_ptr<const 
     output_table->append_chunk(segments);
   }
 
+  Assert(output_table->row_count() == unsorted_table->row_count(), "Mismatching size of input and output table.");
+
   return output_table;
 }
 
 }  // namespace
 
 namespace hyrise {
+
+template <typename SortColumnType>
+class Sort::SortImpl {
+ public:
+  using Row = std::tuple<RowID, bool, SortColumnType>;
+
+  std::chrono::nanoseconds key_materialization_time{};
+  std::chrono::nanoseconds sort_time{};
+  std::chrono::nanoseconds result_materialization_time{};
+
+  SortImpl(const std::shared_ptr<const Table>& table_in, const std::vector<SortColumnDefinition>& sort_definitions,
+           const ChunkOffset output_chunk_size)
+      : _table_in(table_in), _sort_definitions(sort_definitions), _output_chunk_size(output_chunk_size) {}
+
+  std::vector<RowIDPosList> sort() {
+    auto timer = Timer{};
+    _materialize_first_column();
+    key_materialization_time = timer.lap();
+
+    auto timings = SubsortTimings{};
+    subsort_sort(_rows, TableColumnSource{*_table_in, _sort_definitions}, timings);
+    timer.lap();
+    // SORT_US covers the first-column sort and the tie resolution of all further key columns. The values of those
+    // columns are materialized inside the tie resolution (only for tied rows), so that cost is part of it.
+    sort_time = timings.first_column_sort + timings.sub_sort;
+
+    auto pos_lists = _write_pos_lists();
+    result_materialization_time = timer.lap();
+    return pos_lists;
+  }
+
+ protected:
+  // Materializes the first sort column in chunk order.
+  void _materialize_first_column() {
+    const auto column_id = _sort_definitions[0].column;
+    const auto chunk_count = _table_in->chunk_count();
+
+    auto row_count = size_t{0};
+    for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
+      const auto chunk = _table_in->get_chunk(chunk_id);
+      Assert(chunk, "Did not expect deleted chunk here.");  // see https://github.com/hyrise/hyrise/issues/1686
+      row_count += chunk->size();
+    }
+    _rows.resize(row_count);
+
+    auto write_offset = size_t{0};
+    for (auto chunk_id = ChunkID{0}; chunk_id < chunk_count; ++chunk_id) {
+      const auto& segment = _table_in->get_chunk(chunk_id)->get_segment(column_id);
+      segment_iterate<SortColumnType>(*segment, [&](const auto& position) {
+        _rows[write_offset] = Row{RowID{chunk_id, position.chunk_offset()}, position.is_null(), position.value()};
+        ++write_offset;
+      });
+    }
+  }
+
+  std::vector<RowIDPosList> _write_pos_lists() const {
+    const auto row_count = _rows.size();
+    const auto chunk_size = static_cast<size_t>(_output_chunk_size);
+    auto pos_lists = std::vector<RowIDPosList>(div_ceil(row_count, chunk_size));
+    for (auto pos_list_index = size_t{0}; pos_list_index < pos_lists.size(); ++pos_list_index) {
+      const auto begin = pos_list_index * chunk_size;
+      const auto end = std::min(begin + chunk_size, row_count);
+      auto& pos_list = pos_lists[pos_list_index];
+      pos_list.reserve(end - begin);
+      for (auto index = begin; index < end; ++index) {
+        pos_list.emplace_back(std::get<0>(_rows[index]));
+      }
+    }
+    return pos_lists;
+  }
+
+  // NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
+  const std::shared_ptr<const Table> _table_in;
+  const std::vector<SortColumnDefinition>& _sort_definitions;
+  // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
+  const ChunkOffset _output_chunk_size;
+  std::vector<Row> _rows;
+};
 
 Sort::Sort(const std::shared_ptr<const AbstractOperator>& input_operator,
            const std::vector<SortColumnDefinition>& sort_definitions, const ChunkOffset output_chunk_size,
@@ -291,50 +525,37 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     Assert(column_sort_definition.column != INVALID_COLUMN_ID, "Sort: Invalid column in sort definition");
     Assert(column_sort_definition.column < input_table->column_count(),
            "Sort: Column ID is greater than table's column count");
-    Assert(column_sort_definition.sort_mode == SortMode::AscendingNullsFirst ||
-               column_sort_definition.sort_mode == SortMode::DescendingNullsFirst,
-           "Sort does not support NULLS LAST.");
   }
 
   if (input_table->row_count() == 0) {
     if (_force_materialization == ForceMaterialization::Yes && input_table->type() == TableType::References) {
       return Table::create_dummy_table(input_table->column_definitions());
     }
-
     return input_table;
   }
 
-  auto sorted_table = std::shared_ptr<Table>{};
+  auto pos_lists = std::vector<RowIDPosList>{};
+  auto key_materialization_time = std::chrono::nanoseconds{};
+  auto sort_time = std::chrono::nanoseconds{};
+  auto result_materialization_time = std::chrono::nanoseconds{};
 
-  // After the first (least significant) sort operation has been completed, this holds the order of the table as it has
-  // been determined so far. This is not a completely proper PosList on the input table as it might point to
-  // ReferenceSegments.
-  auto previously_sorted_pos_list = std::optional<RowIDPosList>{};
+  const auto first_column_data_type = input_table->column_data_type(_sort_definitions[0].column);
+  resolve_data_type(first_column_data_type, [&](auto type) {
+    using ColumnDataType = typename decltype(type)::type;
 
-  auto total_materialization_time = std::chrono::nanoseconds{};
-  auto total_temporary_result_writing_time = std::chrono::nanoseconds{};
-  auto total_sort_time = std::chrono::nanoseconds{};
+    auto sort_impl = SortImpl<ColumnDataType>(input_table, _sort_definitions, _output_chunk_size);
+    pos_lists = sort_impl.sort();
 
-  for (auto sort_step = static_cast<int64_t>(_sort_definitions.size() - 1); sort_step >= 0; --sort_step) {
-    const auto& sort_definition = _sort_definitions[sort_step];
-    const auto data_type = input_table->column_data_type(sort_definition.column);
+    key_materialization_time = sort_impl.key_materialization_time;
+    sort_time = sort_impl.sort_time;
+    result_materialization_time = sort_impl.result_materialization_time;
+  });
 
-    resolve_data_type(data_type, [&](auto type) {
-      using ColumnDataType = typename decltype(type)::type;
-
-      auto sort_impl = SortImpl<ColumnDataType>(input_table, sort_definition.column, sort_definition.sort_mode);
-      previously_sorted_pos_list = sort_impl.sort(previously_sorted_pos_list);
-
-      total_materialization_time += sort_impl.materialization_time;
-      total_temporary_result_writing_time += sort_impl.temporary_result_writing_time;
-      total_sort_time += sort_impl.sort_time;
-    });
-  }
-
+  // MergeTime and MergePath are left unset: subsort neither generates runs nor merges them. Unset steps read back
+  // as 0, which is the intended reporting for routines that do not have these phases.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
-  step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, total_materialization_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, total_temporary_result_writing_time);
-  step_performance_data.set_step_runtime(OperatorSteps::Sort, total_sort_time);
+  step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, key_materialization_time);
+  step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
@@ -370,17 +591,12 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     }
   }
 
-  if (must_materialize) {
-    sorted_table =
-        write_materialized_output_table(input_table, std::move(*previously_sorted_pos_list), _output_chunk_size);
-  } else {
-    sorted_table =
-        write_reference_output_table(input_table, std::move(*previously_sorted_pos_list), _output_chunk_size);
-  }
+  auto sorted_table = must_materialize
+                          ? write_materialized_output_table(input_table, std::move(pos_lists), _output_chunk_size)
+                          : write_reference_output_table(input_table, std::move(pos_lists), _output_chunk_size);
 
+  // The first sort definition is the most significant one.
   const auto& final_sort_definition = _sort_definitions[0];
-  // Set the sorted_by attribute of the output's chunks according to the most significant sort operation, which is the
-  // column the table was sorted by last.
   const auto output_chunk_count = sorted_table->chunk_count();
   for (auto output_chunk_id = ChunkID{0}; output_chunk_id < output_chunk_count; ++output_chunk_id) {
     const auto& output_chunk = sorted_table->get_chunk(output_chunk_id);
@@ -388,131 +604,10 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     output_chunk->set_individually_sorted_by(final_sort_definition);
   }
 
-  step_performance_data.set_step_runtime(OperatorSteps::WriteOutput, timer.lap());
+  // ResultMaterialization covers the position lists and the output table (the payload gather).
+  step_performance_data.set_step_runtime(OperatorSteps::ResultMaterialization,
+                                         result_materialization_time + timer.lap());
   return sorted_table;
 }
-
-template <typename SortColumnType>
-class Sort::SortImpl {
- public:
-  using RowIDValuePair = std::pair<RowID, SortColumnType>;
-
-  std::chrono::nanoseconds materialization_time{};
-  std::chrono::nanoseconds temporary_result_writing_time{};
-  std::chrono::nanoseconds sort_time{};
-
-  SortImpl(const std::shared_ptr<const Table>& table_in, const ColumnID column_id,
-           const SortMode sort_mode = SortMode::AscendingNullsFirst)
-      : _table_in(table_in), _column_id(column_id), _sort_mode(sort_mode) {
-    const auto row_count = _table_in->row_count();
-    _row_id_value_vector.reserve(row_count);
-    _null_value_rows.reserve(row_count);
-  }
-
-  // Sorts table_in, potentially taking the pre-existing order of previously_sorted_pos_list into account.
-  // Returns a PosList, which can either be used as an input to the next call of sort or for materializing the
-  // output table.
-  RowIDPosList sort(const std::optional<RowIDPosList>& previously_sorted_pos_list) {
-    auto timer = Timer{};
-    // 1. Prepare Sort: Creating RowID-value-Structure
-    _materialize_sort_column(previously_sorted_pos_list);
-    materialization_time = timer.lap();
-
-    // 2. After we got our ValueRowID Map we sort the map by the value of the pair
-    const auto sort_with_comparator = [&](auto comparator) {
-      std::stable_sort(_row_id_value_vector.begin(), _row_id_value_vector.end(),
-                       [comparator](const RowIDValuePair& lhs, const RowIDValuePair& rhs) {
-                         return comparator(lhs.second, rhs.second);
-                       });
-    };
-    if (_sort_mode == SortMode::AscendingNullsFirst) {
-      sort_with_comparator(std::less<>{});
-    } else {
-      sort_with_comparator(std::greater<>{});
-    }
-    sort_time = timer.lap();
-
-    // 2b. Insert null rows in front of all non-NULL rows
-    if (!_null_value_rows.empty()) {
-      // NULLs come before all values. The SQL standard allows for this to be implementation-defined. We used to have
-      // a NULLS LAST mode, but never used it over multiple years. Different databases have different behaviors, and
-      // storing NULLs first even for descending orders is somewhat uncommon:
-      //   https://docs.mendix.com/refguide/ordering-behavior#null-ordering-behavior
-      // For Hyrise, we found that storing NULLs first is the method that requires the least amount of code.
-      _row_id_value_vector.insert(_row_id_value_vector.begin(), _null_value_rows.begin(), _null_value_rows.end());
-    }
-
-    auto pos_list = RowIDPosList{};
-    pos_list.reserve(_row_id_value_vector.size());
-    for (const auto& [row_id, _] : _row_id_value_vector) {
-      pos_list.push_back(row_id);
-    }
-    temporary_result_writing_time = timer.lap();
-    return pos_list;
-  }
-
- protected:
-  // completely materializes the sort column to create a vector of RowID-Value pairs
-  void _materialize_sort_column(const std::optional<RowIDPosList>& previously_sorted_pos_list) {
-    // If there was no PosList passed, this is the first sorting run and we simply fill our values and nulls data
-    // structures from our input table. Otherwise we will materialize according to the PosList which is the result of
-    // the last run.
-    if (previously_sorted_pos_list) {
-      _materialize_column_from_pos_list(*previously_sorted_pos_list);
-    } else {
-      const auto chunk_count = _table_in->chunk_count();
-      for (ChunkID chunk_id{0}; chunk_id < chunk_count; ++chunk_id) {
-        const auto chunk = _table_in->get_chunk(chunk_id);
-        Assert(chunk, "Did not expect deleted chunk here.");  // see https://github.com/hyrise/hyrise/issues/1686
-
-        auto abstract_segment = chunk->get_segment(_column_id);
-
-        segment_iterate<SortColumnType>(*abstract_segment, [&](const auto& position) {
-          if (position.is_null()) {
-            _null_value_rows.emplace_back(RowID{chunk_id, position.chunk_offset()}, SortColumnType{});
-          } else {
-            _row_id_value_vector.emplace_back(RowID{chunk_id, position.chunk_offset()}, position.value());
-          }
-        });
-      }
-    }
-  }
-
-  // When there was a preceding sorting run, we materialize by retaining the order of the values in the passed PosList.
-  void _materialize_column_from_pos_list(const RowIDPosList& pos_list) {
-    const auto input_chunk_count = _table_in->chunk_count();
-    auto accessor_by_chunk_id =
-        std::vector<std::unique_ptr<AbstractSegmentAccessor<SortColumnType>>>(input_chunk_count);
-    for (auto input_chunk_id = ChunkID{0}; input_chunk_id < input_chunk_count; ++input_chunk_id) {
-      const auto& abstract_segment = _table_in->get_chunk(input_chunk_id)->get_segment(_column_id);
-      accessor_by_chunk_id[input_chunk_id] = create_segment_accessor<SortColumnType>(abstract_segment);
-    }
-
-    for (auto row_id : pos_list) {
-      const auto [chunk_id, chunk_offset] = row_id;
-
-      auto& accessor = accessor_by_chunk_id[chunk_id];
-      const auto typed_value = accessor->access(chunk_offset);
-      if (!typed_value) {
-        _null_value_rows.emplace_back(row_id, SortColumnType{});
-      } else {
-        _row_id_value_vector.emplace_back(row_id, typed_value.value());
-      }
-    }
-  }
-
-  // NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
-  const std::shared_ptr<const Table> _table_in;
-
-  // Column to sort by.
-  const ColumnID _column_id;
-  const SortMode _sort_mode;
-  // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
-
-  std::vector<RowIDValuePair> _row_id_value_vector;
-
-  // Stored as RowIDValuePair for better type compatibility even if value is unused.
-  std::vector<RowIDValuePair> _null_value_rows;
-};
 
 }  // namespace hyrise
