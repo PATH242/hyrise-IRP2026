@@ -47,7 +47,7 @@ using namespace hyrise;  // NOLINT(build/namespaces)
 //
 // Two harnesses:
 //   operator  Sort driven directly (GetTable + column pruning + ForceMaterialization::Yes). This is the payload-cost
-//             measurement: the sort produces a RowIDPosList and the payload is gathered afterwards in WriteOutput.
+//             measurement: the sort produces a RowIDPosList; the payload is gathered in ResultMaterialization.
 //   sql       `SELECT * FROM lineitem ORDER BY l_shipdate` through SQLPipeline.
 //
 // REQUIRED PATCH for the sql harness -- carry it in the evaluation commit so every routine branch gets it:
@@ -85,13 +85,11 @@ struct PhaseSpec {
 };
 
 constexpr auto PHASES = std::array{
-    PhaseSpec{"MATERIALIZE_US", Sort::OperatorSteps::MaterializeSortColumns},
+    PhaseSpec{"MATERIALIZE_US", Sort::OperatorSteps::KeyMaterialization},
     PhaseSpec{"SORT_US", Sort::OperatorSteps::Sort},
-    PhaseSpec{"MERGE_US", Sort::OperatorSteps::TemporaryResultWriting},
-    // Uncomment once `MergePath` exists in Sort::OperatorSteps on ALL branches (append it to the enum; order is
-    // irrelevant here since this table maps by name). Nothing else needs to change -- the CSV header follows.
-    // PhaseSpec{"MERGE_PATH_US", Sort::OperatorSteps::MergePath},
-    PhaseSpec{"WRITE_OUT_US", Sort::OperatorSteps::WriteOutput},
+    PhaseSpec{"MERGE_US", Sort::OperatorSteps::MergeTime},
+    PhaseSpec{"MERGE_PATH_US", Sort::OperatorSteps::MergePath},
+    PhaseSpec{"WRITE_OUT_US", Sort::OperatorSteps::ResultMaterialization},
 };
 constexpr auto PHASE_COUNT = PHASES.size();
 

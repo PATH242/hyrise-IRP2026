@@ -597,7 +597,7 @@ size_t determine_merge_partition_count(const size_t row_count) {
 }
 
 // Merge path for the k-way merge: compute the partition boundaries only, so that this phase can be timed separately
-// from the merge itself (OperatorSteps::MergePath vs. OperatorSteps::MergeSortedRuns).
+// from the merge itself (OperatorSteps::MergePath vs. OperatorSteps::MergeTime).
 //
 // boundaries[p][run] = elements of `run` consumed by output position row_count * p / partition_count. Two consecutive
 // boundaries bound one output partition. The first and last boundary are known without any comparisons; the internal
@@ -1087,8 +1087,8 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto padded_key_size = ((normalized_key_size + 3) / 4) * 4;
 
-  // const auto scan_time = timer.lap();
-  timer.lap();
+  // No lap here: the scan and the long-string sort are charged to KeyMaterialization, since they exist only to size and
+  // encode the normalized keys. The timer keeps running into the materialization below.
 
   // Convert the columnar layout into a row layout for better sorting. This is done by encoding all sorted columns
   // into an array of bytes. These rows can be compared using memcmp.
@@ -1202,13 +1202,14 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto merge_time = timer.lap();
 
-  // Note: Sort covers the parallel run generation, MergePath the computation of the merge-path partition boundaries,
-  // and TemporaryResultWriting the merge itself (which also writes the temporary result, i.e., the position list).
+  // Note: KeyMaterialization covers the column scan, long-string sort and key normalization. Sort covers the parallel
+  // run generation, MergePath the merge-path partition boundaries, and MergeTime the merge itself (which also writes
+  // the temporary result, i.e., the position list). ResultMaterialization covers the output table.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
-  step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
+  step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, materialization_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, merge_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
@@ -1259,7 +1260,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     output_chunk->set_individually_sorted_by(final_sort_definition);
   }
 
-  step_performance_data.set_step_runtime(OperatorSteps::WriteOutput, timer.lap());
+  step_performance_data.set_step_runtime(OperatorSteps::ResultMaterialization, timer.lap());
   return sorted_table;
 }
 
