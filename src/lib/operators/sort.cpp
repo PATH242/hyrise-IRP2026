@@ -620,77 +620,19 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   return boundaries;
 }
 
-// Number of independent k-way merges in the first stage (see merge_first_stage). This is the single place to change
-// the policy. The default is one merge per worker, so the first stage fills the machine without merge path, and the
-// fan-in of each merge follows from it: k = ceil(run_count / merge_count), i.e. chunks / workers.
+// Number of sorted runs that run generation produces (run coalescing). The materialized rows are one contiguous array
+// in input order, so a run is simply a contiguous slice of it and need not respect chunk boundaries: run g covers rows
+// [N * g / G, N * (g + 1) / G), which makes every run the same size up to one row. Each run is sorted by one task
+// (radix or pdqsort, see USE_RADIX_SORT), and the merge then combines the G runs in a single partitioned k-way pass.
 //
-// Returning a value <= 1, or one >= run_count, skips the first stage entirely (single partitioned merge over every
-// run -- the previous behaviour).
-size_t determine_first_stage_merge_count(const size_t /*run_count*/, const size_t /*row_count*/,
-                                         const size_t worker_count) {
+// The default is one run per worker, so run generation fills the machine and the merge sees exactly W runs. This is
+// the single place to change the policy -- e.g. return chunk_count for the previous one-run-per-chunk behaviour, or a
+// multiple of the worker count for more, smaller runs. Clamped to [1, row_count] by the caller.
+size_t determine_run_count(const size_t /*row_count*/, const size_t /*chunk_count*/, const size_t worker_count) {
   return worker_count;
 }
 
-// First stage: split `runs` into exactly `merge_count` contiguous, balanced groups -- so each group holds
-// floor(R / merge_count) or ceil(R / merge_count) runs, and k = ceil(R / merge_count) -- and merge every group with its
-// own loser tree, one task per group, no merge path. The merged groups are written to `output` in merged order (at the
-// prefix sum of the group sizes). Returns one run per group, in group order, for the second stage.
-//
-// A group that holds a single run is already sorted, so it is passed through untouched rather than copied: its entry
-// in the returned list simply points at the original run. When runs are only slightly more than merges (e.g. 153 runs
-// on 120 workers, where 87 groups are singletons), this avoids a pass over most of the data that would change nothing.
-//
-// Groups are contiguous in run order and every loser tree breaks ties by lowest index, so a row from an earlier run
-// still precedes an equal row from a later run after both stages: the pipeline stays stable.
-std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>> merge_first_stage(
-    const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
-    const size_t merge_count, NormalizedKeyRow* output) {
-  const auto run_count = runs.size();
-  DebugAssert(merge_count > 1 && merge_count < run_count, "The first stage must reduce the run count to > 1 runs.");
-
-  const auto group_first_run = [&](const size_t group) {
-    return run_count * group / merge_count;
-  };
-
-  auto group_offsets = std::vector<size_t>(merge_count + 1, 0);
-  for (auto group = size_t{0}; group < merge_count; ++group) {
-    const auto first_run = group_first_run(group);
-    const auto last_run = group_first_run(group + 1);
-    DebugAssert(first_run < last_run, "Balanced grouping must not produce an empty group.");
-    auto group_row_count = size_t{0};
-    for (auto run = first_run; run < last_run; ++run) {
-      group_row_count += static_cast<size_t>(runs[run].second - runs[run].first);
-    }
-    group_offsets[group + 1] = group_offsets[group] + group_row_count;
-  }
-
-  auto merged_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(merge_count);
-  auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
-  merge_tasks.reserve(merge_count);
-  for (auto group = size_t{0}; group < merge_count; ++group) {
-    const auto first_run = group_first_run(group);
-    const auto last_run = group_first_run(group + 1);
-
-    if (last_run - first_run == 1) {
-      merged_runs[group] = runs[first_run];  // singleton: already sorted, pass through without copying
-      continue;
-    }
-
-    auto* group_output = output + group_offsets[group];
-    merged_runs[group] = {group_output, group_output + (group_offsets[group + 1] - group_offsets[group])};
-    merge_tasks.emplace_back(std::make_shared<JobTask>([&, group, first_run, last_run, group_output]() {
-      auto group_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(
-          runs.begin() + static_cast<std::ptrdiff_t>(first_run), runs.begin() + static_cast<std::ptrdiff_t>(last_run));
-      merge_partition_of_sorted_runs(group_runs, key_size, group_offsets[group + 1] - group_offsets[group],
-                                     group_output);
-    }));
-  }
-  Hyrise::get().scheduler()->schedule_and_wait_for_tasks(merge_tasks);
-
-  return merged_runs;
-}
-
-// Second stage: merge each output partition delimited by `boundaries` independently, writing
+// Merge each output partition delimited by `boundaries` independently, writing
 // RowIDs straight into that partition's slice of the position list. The boundaries are precomputed by
 // compute_merge_path_boundaries so that the merge path is its own phase.
 RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
@@ -1217,20 +1159,28 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto materialization_time = timer.lap();
 
-  // Scratch buffer for the radix run generation. Dead once the runs are sorted, so the merge cascade reuses it as one
-  // of its two ping-pong buffers (see below).
-  auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(USE_RADIX_SORT ? input_table->row_count() : size_t{0});
+  // Run generation with run coalescing: split the materialized rows into G contiguous, equally sized runs (see
+  // determine_run_count) and sort each with one task. Runs ignore chunk boundaries -- the rows are one array in input
+  // order, so a slice is all a run needs, and equal slices keep the tasks balanced. Radix sort vs. pdqsort is selected
+  // via USE_RADIX_SORT; the scratch buffer is only needed by radix and is sliced the same way.
+  const auto row_count = materialized_rows.size();
+  const auto worker_count = merge_worker_count();
+  const auto run_count =
+      std::clamp(determine_run_count(row_count, static_cast<size_t>(chunk_count), worker_count), size_t{1}, row_count);
+  const auto run_begin_offset = [&](const size_t run_index) {
+    return row_count * run_index / run_count;
+  };
 
-  // Sort each chunk's slice of the materialized rows independently and in parallel. Every chunk becomes a sorted run
-  // for the subsequent merge (run generation / sink phase). Radix sort vs. pdqsort is selected via USE_RADIX_SORT.
+  auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(USE_RADIX_SORT ? row_count : size_t{0});
+
   auto sort_run_tasks = std::vector<std::shared_ptr<AbstractTask>>();
-  sort_run_tasks.reserve(chunk_count);
-  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
+  sort_run_tasks.reserve(run_count);
+  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
     sort_run_tasks.emplace_back(std::make_shared<JobTask>([&, run_index]() {
-      auto* run_begin = materialized_rows.data() + chunk_offsets[run_index];
-      auto* run_end = materialized_rows.data() + chunk_offsets[run_index + 1];
+      auto* run_begin = materialized_rows.data() + run_begin_offset(run_index);
+      auto* run_end = materialized_rows.data() + run_begin_offset(run_index + 1);
       if constexpr (USE_RADIX_SORT) {
-        auto* run_scratch = sort_scratch.data() + chunk_offsets[run_index];
+        auto* run_scratch = sort_scratch.data() + run_begin_offset(run_index);
         radix_sort(run_begin, run_end, run_scratch, normalized_key_size);
       } else {
         boost::sort::pdqsort(run_begin, run_end,
@@ -1244,33 +1194,15 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto sort_time = timer.lap();
 
-  // Merge the sorted runs (one per chunk) into the final position list, in two stages:
-  //   1. First stage: W independent k-way merges with k = ceil(runs / W) (see determine_first_stage_merge_count), one
-  //      task each, no partitioning. Writes NormalizedKeyRows into sort_scratch (dead since run generation); singleton
-  //      groups are passed through without copying. Skipped when there are no more runs than merges.
-  //   2. Second stage: one k-way merge over the (at most W) runs left, split by merge path into one partition per
-  //      worker, writing RowIDs. Its fan-in is whatever the first stage left, not the first stage's k.
-  const auto row_count = materialized_rows.size();
+  // Merge the G sorted runs in one pass: merge path splits the output into one partition per active worker, and each
+  // partition is merged by its own loser tree, writing RowIDs straight into the position list.
   auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
-  runs.reserve(chunk_count);
-  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
-    runs.emplace_back(materialized_rows.data() + chunk_offsets[run_index],
-                      materialized_rows.data() + chunk_offsets[run_index + 1]);
+  runs.reserve(run_count);
+  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
+    runs.emplace_back(materialized_rows.data() + run_begin_offset(run_index),
+                      materialized_rows.data() + run_begin_offset(run_index + 1));
   }
 
-  const auto worker_count = merge_worker_count();
-  const auto first_stage_merge_count = determine_first_stage_merge_count(runs.size(), row_count, worker_count);
-  if (first_stage_merge_count > 1 && first_stage_merge_count < runs.size()) {
-    if (sort_scratch.size() < row_count) {
-      sort_scratch = uninitialized_vector<NormalizedKeyRow>(row_count);  // only without radix run generation
-    }
-    runs = merge_first_stage(runs, normalized_key_size, first_stage_merge_count, sort_scratch.data());
-  }
-
-  const auto level_time = timer.lap();
-
-  // Merge path of the finish: one partition per active worker, computed as its own phase so that the cost of finding
-  // the boundaries is reported separately from the cost of merging.
   const auto merge_partition_count = determine_merge_partition_count(row_count);
   const auto merge_path_boundaries =
       compute_merge_path_boundaries(runs, normalized_key_size, row_count, merge_partition_count);
@@ -1279,16 +1211,16 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   auto position_list = merge_partitions(runs, normalized_key_size, row_count, merge_path_boundaries);
 
-  const auto finish_time = timer.lap();
+  const auto merge_time = timer.lap();
 
-  // Note: KeyMaterialization covers the column scan, long-string sort and key normalization. Sort covers the parallel
-  // run generation, MergePath the second stage's merge-path boundaries, and MergeTime all merging (first stage plus
-  // partitioned second stage, which writes the position list). ResultMaterialization covers the output table.
+  // Note: KeyMaterialization covers the column scan, long-string sort and key normalization, Sort the run generation
+  // (including coalescing into G runs), MergePath the merge-path boundaries, MergeTime the partitioned merge (which
+  // also writes the temporary result, i.e., the position list), and ResultMaterialization the payload gather.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
   step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, materialization_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
-  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, level_time + finish_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, merge_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
