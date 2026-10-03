@@ -24,13 +24,6 @@ target_link_libraries(
     hyriseBenchmarkLib
 )
 
-# Configure DYODEvaluation
-add_executable(
-    hyriseDYODEvaluation
-
-    dyod_evaluation.cpp
-)
-
 add_executable(
     SortEvaluationTPCH
 
@@ -41,13 +34,6 @@ add_executable(
     SortEvaluationTPCDS
 
     sort_evaluation_tpcds.cpp
-)
-
-target_link_libraries(
-    hyriseDYODEvaluation
-
-    hyrise
-    hyriseBenchmarkLib
 )
 
 target_link_libraries(
