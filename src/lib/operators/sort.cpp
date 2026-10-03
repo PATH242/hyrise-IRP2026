@@ -49,7 +49,7 @@
  * then sorted by the next sort column, whose values are fetched only for the rows of that run.
  *
  * There is no parallelism anywhere in this operator: no tasks, no scheduler, no k-way merge. The MergeTime and
- * MergePath steps therefore stay unset (they read back as 0), and SORT_US covers the first-column sort plus all tie
+ * MergePath steps are therefore reported as 0, and SORT_US covers the first-column sort plus all tie
  * resolution.
  *
  * Derived from the subsort in hyrise/dyod2025_group1717 (src/lib/operators/sort.cpp). Changes relative to it:
@@ -551,11 +551,12 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     result_materialization_time = sort_impl.result_materialization_time;
   });
 
-  // MergeTime and MergePath are left unset: subsort neither generates runs nor merges them. Unset steps read back
-  // as 0, which is the intended reporting for routines that do not have these phases.
+  // MergeTime and MergePath are reported as 0: subsort neither generates runs nor merges them.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
   step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, key_materialization_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, std::chrono::nanoseconds{0});
+  step_performance_data.set_step_runtime(OperatorSteps::MergePath, std::chrono::nanoseconds{0});
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
