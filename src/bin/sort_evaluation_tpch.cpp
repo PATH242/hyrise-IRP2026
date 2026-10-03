@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "benchmark_config.hpp"
-#include "encoding_config.hpp"
 #include "hyrise.hpp"
 #include "operators/abstract_operator.hpp"
 #include "operators/get_table.hpp"
@@ -29,7 +28,6 @@
 #include "sql/sql_pipeline_builder.hpp"
 #include "sql/sql_pipeline_statement.hpp"
 #include "storage/chunk.hpp"
-#include "storage/encoding_type.hpp"
 #include "storage/table.hpp"
 #include "tpch/tpch_constants.hpp"
 #include "tpch/tpch_table_generator.hpp"
@@ -41,11 +39,11 @@ using namespace hyrise;  // NOLINT(build/namespaces)
 // =====================================================================================================================
 // Isolated-sort evaluation of Hyrise sort routines, structured as the DuckDB v1.4.0 "Sorting Again" blog analog.
 //
-// One process handles exactly ONE (routine, scale factor, encoding) cell. That is deliberate:
-//   * Hyrise caches generated tables in a CWD-relative `tpch_cached_tables/sf-<sf>` directory and encodes BEFORE
-//     writing that cache, so two encodings in one process (or one working directory) silently clobber each other.
+// One process handles exactly ONE (routine, scale factor) cell. That is deliberate:
+//   * Hyrise caches generated tables in a CWD-relative `tpch_cached_tables/sf-<sf>` directory, so all runs of all
+//     routines share one cache and are provably measured on identical input bytes.
 //   * Two scale factors in one process would register `lineitem` twice in the StorageManager.
-// run_evaluation.sh loops over the cells and gives each its own working directory.
+// run_evaluation.sh loops over the scale factors from one shared working directory.
 //
 // Two harnesses:
 //   operator  Sort driven directly (GetTable + column pruning + ForceMaterialization::Yes). This is the payload-cost
@@ -260,13 +258,6 @@ static Options parse_options(int argc, char* argv[]) {
   return options;
 }
 
-static EncodingConfig encoding_config_for(const std::string& name) {
-  if (name == "unencoded") {
-    return EncodingConfig::unencoded();
-  }
-  return EncodingConfig{SegmentEncodingSpec{EncodingType::Dictionary}};
-}
-
 // ---------------------------------------------------------------------------------------------------------------
 // Measurement
 // ---------------------------------------------------------------------------------------------------------------
@@ -474,7 +465,6 @@ int main(int argc, char* argv[]) {
 
   auto benchmark_config = std::make_shared<BenchmarkConfig>();
   benchmark_config->cache_binary_tables = true;
-  benchmark_config->encoding_config = encoding_config_for(options.encoding_name);
   silent_tpch_generation(options.scale_factor, benchmark_config);
 
   // Depends on the generated table, so it cannot be a constant: which columns are payload depends on the key set.
