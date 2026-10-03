@@ -51,8 +51,9 @@ namespace {
 
 using namespace hyrise;
 
-// The number of bytes after that long strings are shortened.
-constexpr size_t STRING_CUTOFF = 64;
+// The number of bytes after that long strings are shortened (string key prefix length). The paper encodes a 12-byte
+// prefix; we use 32 bytes, which is also the upper bound of the pre-compiled static_memcmp sizes.
+constexpr size_t STRING_CUTOFF = 32;
 
 // Divide left by right and round up to the next larger integer.
 auto div_ceil(const auto left, const auto right) {
@@ -60,7 +61,9 @@ auto div_ceil(const auto left, const auto right) {
   return (left + right - 1) / right;
 }
 
-// Run generation: radix sort (this file) vs. pdqsort.
+// Run generation: radix sort (this file) vs. pdqsort. As in the paper (Kuiper & Muehleisen, ICDE 2023, Sec. VII),
+// radix sort is used unless a sort column is a string, in which case runs are sorted with pdqsort. Setting this to
+// false forces pdqsort for all inputs.
 constexpr bool USE_RADIX_SORT = true;
 
 // Adaptive merge partitioning (see parallel_binary_merge): when true, each level targets a total task count of
@@ -266,20 +269,79 @@ std::shared_ptr<Table> write_reference_output_table(const std::shared_ptr<const 
 }
 
 /**
- * Implementation of DuckDB's static memcmp. This optimizes calls to memcmp by passing a compile-time known length. If
- * optimized correctly the compiler would resolve the implementation to a switch like statement.
- *
- * `start` and `end` define the range of compile-time known lengthes.
+ * Implementation of DuckDB's static memcmp (paper, Sec. VI.B). Every case calls memcmp with a compile-time known
+ * length, which lets the compiler inline and specialize each call; the switch itself compiles to a jump table. Since
+ * the length is constant throughout a sort, the branch predictor predicts the dispatch perfectly. Lengths above 32 fall
+ * back to a dynamic memcmp.
  */
-template <size_t start, size_t end>
-int static_memcmp(std::byte* left, std::byte* right, size_t len) {
-  if (len == start) {
-    return memcmp(left, right, start);
-  }
-  if constexpr (start < end) {
-    return static_memcmp<start + 1, end>(left, right, len);
-  } else {
-    return memcmp(left, right, len);
+int static_memcmp(const std::byte* left, const std::byte* right, size_t len) {
+  switch (len) {
+    case 1:
+      return memcmp(left, right, 1);
+    case 2:
+      return memcmp(left, right, 2);
+    case 3:
+      return memcmp(left, right, 3);
+    case 4:
+      return memcmp(left, right, 4);
+    case 5:
+      return memcmp(left, right, 5);
+    case 6:
+      return memcmp(left, right, 6);
+    case 7:
+      return memcmp(left, right, 7);
+    case 8:
+      return memcmp(left, right, 8);
+    case 9:
+      return memcmp(left, right, 9);
+    case 10:
+      return memcmp(left, right, 10);
+    case 11:
+      return memcmp(left, right, 11);
+    case 12:
+      return memcmp(left, right, 12);
+    case 13:
+      return memcmp(left, right, 13);
+    case 14:
+      return memcmp(left, right, 14);
+    case 15:
+      return memcmp(left, right, 15);
+    case 16:
+      return memcmp(left, right, 16);
+    case 17:
+      return memcmp(left, right, 17);
+    case 18:
+      return memcmp(left, right, 18);
+    case 19:
+      return memcmp(left, right, 19);
+    case 20:
+      return memcmp(left, right, 20);
+    case 21:
+      return memcmp(left, right, 21);
+    case 22:
+      return memcmp(left, right, 22);
+    case 23:
+      return memcmp(left, right, 23);
+    case 24:
+      return memcmp(left, right, 24);
+    case 25:
+      return memcmp(left, right, 25);
+    case 26:
+      return memcmp(left, right, 26);
+    case 27:
+      return memcmp(left, right, 27);
+    case 28:
+      return memcmp(left, right, 28);
+    case 29:
+      return memcmp(left, right, 29);
+    case 30:
+      return memcmp(left, right, 30);
+    case 31:
+      return memcmp(left, right, 31);
+    case 32:
+      return memcmp(left, right, 32);
+    default:
+      return memcmp(left, right, len);
   }
 }
 
@@ -295,7 +357,7 @@ struct NormalizedKeyRow {
     }
     DebugAssert(key_head, "NormalizedKey is not valid.");
     DebugAssert(other.key_head, "NormalizedKey is not valid.");
-    return static_memcmp<1, 32>(key_head, other.key_head, expected_size) < 0;
+    return static_memcmp(key_head, other.key_head, expected_size) < 0;
   }
 };
 
@@ -456,23 +518,55 @@ inline size_t merge_worker_target() {
   return std::max<size_t>(size_t{1}, Hyrise::get().topology.num_cpus());
 }
 
+// Number of initial sorted runs: one per parallel execution slot (paper: one thread-local run per thread), never more
+// than there are chunks. Uses the same worker target as the merge, so the algorithm is identical with and without a
+// worker-based scheduler: in single-threaded execution the same runs are produced and merged, the tasks just run
+// sequentially.
+inline size_t determine_run_count(const size_t chunk_count) {
+  return std::clamp(merge_worker_target(), size_t{1}, std::max(size_t{1}, chunk_count));
+}
+
 // Cascaded 2-way merge with Merge Path parallelism (old DuckDB design). `src` holds the sorted runs delimited by
 // `boundaries` (size = run_count + 1, last entry == row_count); `scratch` is a same-sized buffer. The two buffers
 // ping-pong across levels; the fully merged run is extracted into the returned position list.
+//
+// Every level runs in two phases, each a wave of scheduler tasks:
+//   1. Merge Path: the A-side split points of every split pair are computed, one task per internal boundary. The
+//      boundaries are independent of each other, so this phase runs at the parallelism of the scheduler.
+//   2. Merge: one task per partition, using the precomputed split points.
+// The wall-clock time of phase 1 is accumulated in `merge_path_time` (timer laps around the task wave). The caller
+// subtracts it from the total to obtain the pure merge time, so the two steps never overlap. Pairs that are not split
+// (one partition) need no boundary and add no task.
 RowIDPosList parallel_binary_merge(NormalizedKeyRow* src, NormalizedKeyRow* scratch, std::vector<size_t> boundaries,
-                                   const size_t key_size, const size_t row_count) {
+                                   const size_t key_size, const size_t row_count,
+                                   std::chrono::nanoseconds& merge_path_time) {
+  struct PairPlan {
+    size_t a_begin;
+    size_t b_begin;
+    size_t len_a;
+    size_t len_b;
+    size_t total;
+    size_t partitions;
+    // split_a[p] = number of A elements among the first total * p / partitions merged outputs.
+    std::vector<size_t> split_a;
+  };
+
   auto* current = src;
   auto* other = scratch;
 
   const auto worker_target = merge_worker_target();
   const auto task_target = MERGE_TASKS_PER_WORKER * worker_target;
 
+  merge_path_time = std::chrono::nanoseconds{0};
+  auto timer = Timer{};
+
   while (boundaries.size() > 2) {  // more than one run remaining
     const auto run_count = boundaries.size() - 1;
     const auto pair_count = run_count / 2;
 
     auto next_boundaries = std::vector<size_t>();
-    auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+    auto plans = std::vector<PairPlan>();
+    plans.reserve(pair_count);
 
     for (auto run = size_t{0}; run + 1 < run_count; run += 2) {
       const auto a_begin = boundaries[run];
@@ -500,15 +594,41 @@ RowIDPosList parallel_binary_merge(NormalizedKeyRow* src, NormalizedKeyRow* scra
         partitions = std::clamp(div_ceil(total, MERGE_PATH_MIN_PARTITION_SIZE), size_t{1}, total);
       }
 
-      for (auto partition = size_t{0}; partition < partitions; ++partition) {
+      auto plan = PairPlan{a_begin, b_begin, len_a, len_b, total, partitions, std::vector<size_t>(partitions + 1, 0)};
+      plan.split_a.back() = len_a;  // first (0) and last (len_a) boundary are known without any comparison
+      plans.push_back(std::move(plan));
+    }
+
+    // --- Phase 1: Merge Path. One task per internal boundary; tasks write to distinct elements of split_a.
+    timer.lap();  // discard the (trivial) level setup so that only the task wave is attributed to merge path
+    auto merge_path_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+    for (auto plan_index = size_t{0}; plan_index < plans.size(); ++plan_index) {
+      for (auto partition = size_t{1}; partition < plans[plan_index].partitions; ++partition) {
+        merge_path_tasks.emplace_back(std::make_shared<JobTask>([&, plan_index, partition]() {
+          auto& plan = plans[plan_index];
+          plan.split_a[partition] =
+              merge_path(current + plan.a_begin, plan.len_a, current + plan.b_begin, plan.len_b,
+                         plan.total * partition / plan.partitions, key_size);
+        }));
+      }
+    }
+    Hyrise::get().scheduler()->schedule_and_wait_for_tasks(merge_path_tasks);
+    merge_path_time += timer.lap();
+
+    // --- Phase 2: Merge. One task per partition, using the precomputed split points.
+    auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+    for (const auto& plan : plans) {
+      for (auto partition = size_t{0}; partition < plan.partitions; ++partition) {
+        const auto a_begin = plan.a_begin;
+        const auto b_begin = plan.b_begin;
+        const auto out_from = plan.total * partition / plan.partitions;
+        const auto out_to = plan.total * (partition + 1) / plan.partitions;
+        const auto a_from = plan.split_a[partition];
+        const auto a_to = plan.split_a[partition + 1];
         merge_tasks.emplace_back(std::make_shared<JobTask>(
-            [current, other, a_begin, b_begin, len_a, len_b, total, partition, partitions, key_size]() {
+            [current, other, a_begin, b_begin, out_from, out_to, a_from, a_to, key_size]() {
               const auto* a_run = current + a_begin;
               const auto* b_run = current + b_begin;
-              const auto out_from = total * partition / partitions;
-              const auto out_to = total * (partition + 1) / partitions;
-              const auto a_from = merge_path(a_run, len_a, b_run, len_b, out_from, key_size);
-              const auto a_to = merge_path(a_run, len_a, b_run, len_b, out_to, key_size);
               merge_range(a_run + a_from, a_run + a_to, b_run + (out_from - a_from), b_run + (out_to - a_to),
                           other + a_begin + out_from, key_size);
             }));
@@ -956,7 +1076,8 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto padded_key_size = ((normalized_key_size + 3) / 4) * 4;
 
-  // const auto scan_time = timer.lap();
+  // Key-width scan + long-string presort are deliberately not attributed to a step (lap is discarded), so they show up
+  // as unattributed time. The key materialization step below starts from a fresh lap.
   timer.lap();
 
   // Convert the columnar layout into a row layout for better sorting. This is done by encoding all sorted columns
@@ -1015,21 +1136,35 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   }
   Hyrise::get().scheduler()->schedule_and_wait_for_tasks(materialization_tasks);
 
-  const auto materialization_time = timer.lap();
+  // Key materialization step: row-array + key-buffer allocation and normalization (encoding) of all sort columns into
+  // memcmp-comparable bytes. Charged to OperatorSteps::KeyMaterialization.
+  const auto key_materialization_time = timer.lap();
 
   // Scratch buffer used by the radix run generation and by the parallel binary merge's ping-pong (always needed).
   auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(input_table->row_count());
 
-  // Sort each chunk's slice of the materialized rows independently and in parallel. Every chunk becomes a sorted run
-  // for the subsequent merge (run generation / sink phase). Radix sort vs. pdqsort is selected via USE_RADIX_SORT.
+  // Group contiguous chunks into one run per worker (see determine_run_count). The materialized rows are laid out in
+  // chunk order, so a group of contiguous chunks is a contiguous row range: run r covers
+  // [run_offsets[r], run_offsets[r + 1]). Contiguity and radix sort's stability preserve the run-order tie-break of
+  // the merge, so the whole pipeline stays stable.
+  const auto run_count = determine_run_count(static_cast<size_t>(chunk_count));
+  auto run_offsets = std::vector<size_t>(run_count + 1);
+  for (auto run_index = size_t{0}; run_index <= run_count; ++run_index) {
+    run_offsets[run_index] = chunk_offsets[static_cast<size_t>(chunk_count) * run_index / run_count];
+  }
+
+  // Sort each run independently and in parallel; every run is a sorted input for the subsequent merge (run generation
+  // / sink phase). As in the paper, radix sort is used unless a sort column is a string (then pdqsort);
+  // USE_RADIX_SORT = false forces pdqsort everywhere.
+  const auto use_radix_sort = USE_RADIX_SORT && !contains_string_column;
   auto sort_run_tasks = std::vector<std::shared_ptr<AbstractTask>>();
-  sort_run_tasks.reserve(chunk_count);
-  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
+  sort_run_tasks.reserve(run_count);
+  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
     sort_run_tasks.emplace_back(std::make_shared<JobTask>([&, run_index]() {
-      auto* run_begin = materialized_rows.data() + chunk_offsets[run_index];
-      auto* run_end = materialized_rows.data() + chunk_offsets[run_index + 1];
-      if constexpr (USE_RADIX_SORT) {
-        auto* run_scratch = sort_scratch.data() + chunk_offsets[run_index];
+      auto* run_begin = materialized_rows.data() + run_offsets[run_index];
+      auto* run_end = materialized_rows.data() + run_offsets[run_index + 1];
+      if (use_radix_sort) {
+        auto* run_scratch = sort_scratch.data() + run_offsets[run_index];
         radix_sort(run_begin, run_end, run_scratch, normalized_key_size);
       } else {
         boost::sort::pdqsort(run_begin, run_end,
@@ -1043,16 +1178,21 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto sort_time = timer.lap();
 
-  // Merge the k sorted runs (k = chunk count) into the final position list.
-  // Cascaded 2-way parallel binary merge (Merge Path), worker-gated.
-  auto position_list = parallel_binary_merge(materialized_rows.data(), sort_scratch.data(), chunk_offsets,
-                                             normalized_key_size, materialized_rows.size());
+  // Merge the n sorted runs (n = run count, one per worker) into the final position list.
+  // Cascaded 2-way parallel binary merge (Merge Path), worker-gated. Merge Path split-point computation is timed
+  // separately inside parallel_binary_merge and returned through merge_path_time.
+  auto merge_path_time = std::chrono::nanoseconds{0};
+  auto position_list = parallel_binary_merge(materialized_rows.data(), sort_scratch.data(), run_offsets,
+                                             normalized_key_size, materialized_rows.size(), merge_path_time);
 
-  const auto merge_time = timer.lap();
+  // The lap covers merge path + merge + RowID extraction; subtract merge path so the two steps do not overlap.
+  const auto merge_total_time = timer.lap();
+  const auto merge_time = merge_total_time - merge_path_time;
 
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
-  step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, merge_time);
+  step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, key_materialization_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, merge_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
@@ -1104,7 +1244,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     output_chunk->set_individually_sorted_by(final_sort_definition);
   }
 
-  step_performance_data.set_step_runtime(OperatorSteps::WriteOutput, timer.lap());
+  step_performance_data.set_step_runtime(OperatorSteps::ResultMaterialization, timer.lap());
   return sorted_table;
 }
 
