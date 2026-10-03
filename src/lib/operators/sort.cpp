@@ -775,9 +775,11 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   // TODO(student): Update performance metrics.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
-  step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, write_back_time);
-  step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
+  step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, materialization_time);
+  // The temporary result writing (position list) is part of the sort. This algorithm has no merge phase.
+  step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time + write_back_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, std::chrono::nanoseconds{0});
+  step_performance_data.set_step_runtime(OperatorSteps::MergePath, std::chrono::nanoseconds{0});
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
@@ -828,7 +830,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     output_chunk->set_individually_sorted_by(final_sort_definition);
   }
 
-  step_performance_data.set_step_runtime(OperatorSteps::WriteOutput, timer.lap());
+  step_performance_data.set_step_runtime(OperatorSteps::ResultMaterialization, timer.lap());
   return sorted_table;
 }
 

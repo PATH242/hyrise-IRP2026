@@ -19,7 +19,13 @@ class Sort : public AbstractReadOnlyOperator {
  public:
   enum class ForceMaterialization : bool { Yes = true, No = false };
 
-  enum class OperatorSteps : uint8_t { MaterializeSortColumns, Sort, TemporaryResultWriting, WriteOutput };
+  enum class OperatorSteps : uint8_t {
+    Sort,
+    MergeTime,
+    MergePath,
+    KeyMaterialization,
+    ResultMaterialization
+  };
 
   Sort(const std::shared_ptr<const AbstractOperator>& input_operator,
        const std::vector<SortColumnDefinition>& sort_definitions,
