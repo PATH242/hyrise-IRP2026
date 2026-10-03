@@ -34,8 +34,34 @@ add_executable(
     dyod_evaluation.cpp
 )
 
+add_executable(
+    SortEvaluationTPCH
+
+    sort_evaluation_tpch.cpp
+)
+
+add_executable(
+    SortEvaluationTPCDS
+
+    sort_evaluation_tpcds.cpp
+)
+
 target_link_libraries(
     hyriseDYODEvaluation
+
+    hyrise
+    hyriseBenchmarkLib
+)
+
+target_link_libraries(
+    SortEvaluationTPCH
+
+    hyrise
+    hyriseBenchmarkLib
+)
+
+target_link_libraries(
+    SortEvaluationTPCDS
 
     hyrise
     hyriseBenchmarkLib
