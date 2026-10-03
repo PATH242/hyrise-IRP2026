@@ -82,10 +82,29 @@ constexpr auto VERGESORT_FALLBACK = VergesortFallback::SkaSort;
 // Vergesort and ska sort tuning constants, all set to the upstream defaults.
 // Below VERGESORT_MIN_SIZE rows, vergesort does not probe for runs (upstream: 128).
 constexpr size_t VERGESORT_MIN_SIZE = 128;
-// Ska sort: partitions below this size are sorted with pdqsort (upstream StdSortThreshold: 128).
+// Ska sort: partitions below this size go to StdSortFallback, i.e., vergesort + pdqsort_branchless (StdSortThreshold).
 constexpr size_t SKA_SORT_STD_SORT_THRESHOLD = 128;
-// Ska sort: partitions up to this size use American flag sort, larger ones ska byte sort (upstream: 1024).
+// Ska sort: partitions below this size use American flag sort, larger ones ska byte sort (AmericanFlagSortThreshold).
 constexpr size_t SKA_SORT_AMERICAN_FLAG_THRESHOLD = 1024;
+
+// Merge of the sorted runs (sorted_run_merger.cpp in DuckDB v1.4.0). Both variants share the k-way merge path
+// boundaries; they differ in how a partition is merged.
+//   LoserTree       - k-way merge with a loser (tournament) tree, as described in the DuckDB v1.4 blog post.
+//   ConcatVergesort - what DuckDB v1.4.0 actually does (SortedRunMergerLocalState::TemplatedMergePartition): copy the
+//                     partition's slice of every run into one buffer and sort it with vergesort + pdqsort_branchless.
+//                     Vergesort detects the slices as runs and merges them pairwise with std::inplace_merge.
+enum class MergeAlgorithm : uint8_t { LoserTree, ConcatVergesort };
+constexpr auto MERGE_ALGORITHM = MergeAlgorithm::ConcatVergesort;
+
+// How the merged output is cut into partitions (one task each).
+//   PerWorker - one partition per active worker, of equal size.
+//   FixedSize - DuckDB v1.4.0 (Sort::Finalize): partitions of MERGE_PARTITION_SIZE rows (DEFAULT_ROW_GROUP_SIZE), or
+//               MERGE_PARTITION_SIZE_SINGLE_THREADED rows (STANDARD_VECTOR_SIZE) with a single thread. The last
+//               partition takes the remainder. Partitions are picked up by workers as they become free.
+enum class MergePartitioning : uint8_t { PerWorker, FixedSize };
+constexpr auto MERGE_PARTITIONING = MergePartitioning::PerWorker;
+constexpr size_t MERGE_PARTITION_SIZE = 122'880;
+constexpr size_t MERGE_PARTITION_SIZE_SINGLE_THREADED = 2'048;
 
 // Radix sort tuning constants.
 constexpr size_t RADIX_BUCKET_SIZE = 256;
@@ -450,21 +469,20 @@ struct NormalizedKeyRow {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Ska sort (vergesort fallback). Port of skarupke/ska_sort's in-place MSD radix sort (inplace_radix_sort<128, 1024>)
-// with the 8-byte inline prefix as the extracted key, which is what DuckDB v1.4 radix-sorts ("the first 64-bit integer
-// of the sort key"). Per partition:
-//   size <  SKA_SORT_STD_SORT_THRESHOLD      -> pdqsort                     (upstream: std::sort)
-//   size <= SKA_SORT_AMERICAN_FLAG_THRESHOLD -> American flag sort          (upstream american_flag_sort)
-//   otherwise                                -> ska byte sort               (upstream ska_byte_sort)
-// After the last prefix byte, all rows of a partition share their prefix: for keys of at most 8 bytes they are equal
-// and the recursion stops (upstream: no recursion after the last byte); longer keys are handed to pdqsort with the
-// full comparator (upstream: next_sort; DuckDB: "not fully sorted after the first 64-bit integer -> pdqsort").
-// The radix passes read only row.prefix, which lives in the row array, so they never dereference key_head.
+// Ska sort (vergesort fallback). Port of DuckDB v1.4.0's vendored third_party/ska_sort/ska_sort.hpp
+// (inplace_radix_sort<128, 1024> with DuckDB's SkaExtractKey from src/common/sorting/sorted_run.cpp), with the 8-byte
+// inline prefix as the extracted key (DuckDB: SORT_KEY::part0). Per partition:
+//   size <= 1                               -> done
+//   size <  SKA_SORT_STD_SORT_THRESHOLD     -> StdSortFallback              (DuckDB: vergesort + pdqsort_branchless)
+//   size <  SKA_SORT_AMERICAN_FLAG_THRESHOLD -> American flag sort
+//   otherwise                               -> ska byte sort (unrolled four times)
+// The radix depth is ska_sort_width = min(8, key_size) bytes (DuckDB: min(sort width, 8)). After the last byte, keys
+// of at most 8 bytes are fully ordered and recursion stops; longer keys (DuckDB: requires_next_sort) hand each
+// partition to StdSortFallback with the full comparator. The radix passes read only row.prefix, which lives in the
+// row array, so they never dereference key_head.
 //
-// Deviations from upstream:
-//  1. The radix depth is min(8, key_size) bytes instead of all 8 bytes of the uint64: prefix bytes past the key are
-//     zero padding and would only cost counting passes.
-//  2. Upstream's unroll_loop_four_times in the ska byte sort swap loop is a plain loop here.
+// Not ported: ByteIsSkippable (DuckDB skips the NULL byte of leading non-NULL fixed-width columns; Hyrise does not
+// emit a NULL byte for non-nullable columns, so there is nothing to skip) and the Interrupted() check.
 // ---------------------------------------------------------------------------------------------------------------------
 
 inline size_t prefix_byte_at(const NormalizedKeyRow& row, const size_t byte_index) {
@@ -502,7 +520,22 @@ uint8_t* ska_custom_partition(uint8_t* begin, uint8_t* end, const Predicate& pre
 
 void ska_sort_partition(NormalizedKeyRow* begin, NormalizedKeyRow* end, size_t byte_index, size_t key_size);
 
-// Upstream StdSortIfLessThanThreshold: returns true if the range was fully handled (<= 1 row, or pdqsorted).
+template <typename Fallback>
+void vergesort(NormalizedKeyRow* first, NormalizedKeyRow* last, size_t key_size, const Fallback& fallback);
+
+// DuckDB StdSortFallback: vergesort with pdqsort_branchless as its fallback, using the full comparator ("LNK note
+// that we use the full comparison (not just extracted key) here"). Used for small partitions and for prefix ties.
+void ska_std_sort_fallback(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t key_size) {
+  vergesort(begin, end, key_size, [key_size](NormalizedKeyRow* fallback_begin, NormalizedKeyRow* fallback_end) {
+    boost::sort::pdqsort_branchless(fallback_begin, fallback_end,
+                                    [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
+                                      return lhs.less_than(rhs, key_size);
+                                    });
+  });
+}
+
+// DuckDB StdSortIfLessThanThreshold: returns true if the range was fully handled (<= 1 row, or sorted by the
+// fallback because it is below the threshold).
 inline bool ska_pdqsort_if_less_than_threshold(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t key_size) {
   const auto row_count = static_cast<size_t>(end - begin);
   if (row_count <= 1) {
@@ -511,10 +544,40 @@ inline bool ska_pdqsort_if_less_than_threshold(NormalizedKeyRow* begin, Normaliz
   if (row_count >= SKA_SORT_STD_SORT_THRESHOLD) {
     return false;
   }
-  boost::sort::pdqsort(begin, end, [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
-    return lhs.less_than(rhs, key_size);
-  });
+  ska_std_sort_fallback(begin, end, key_size);
   return true;
+}
+
+// DuckDB/upstream unroll_loop_four_times.
+template <typename Function>
+inline void ska_unroll_loop_four_times(NormalizedKeyRow* begin, const size_t iteration_count, const Function& to_call) {
+  auto loop_count = iteration_count / 4;
+  const auto remainder_count = iteration_count - (loop_count * 4);
+  for (; loop_count > 0; --loop_count) {
+    to_call(begin);
+    ++begin;
+    to_call(begin);
+    ++begin;
+    to_call(begin);
+    ++begin;
+    to_call(begin);
+    ++begin;
+  }
+  switch (remainder_count) {
+    case 3:
+      to_call(begin);
+      ++begin;
+      [[fallthrough]];
+    case 2:
+      to_call(begin);
+      ++begin;
+      [[fallthrough]];
+    case 1:
+      to_call(begin);
+      break;
+    default:
+      break;
+  }
 }
 
 // True if radix-sorting byte `byte_index` finishes the ordering, i.e., no recursion into the partitions is needed.
@@ -625,13 +688,11 @@ void ska_byte_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t 
       if (begin_offset == end_offset) {
         return false;
       }
-      auto* it = begin + begin_offset;
-      const auto swap_count = end_offset - begin_offset;
-      for (auto index = size_t{0}; index < swap_count; ++index, ++it) {
+      ska_unroll_loop_four_times(begin + begin_offset, end_offset - begin_offset, [&](NormalizedKeyRow* it) {
         const auto target_partition = prefix_byte_at(*it, byte_index);
         const auto offset = partitions[target_partition].offset++;
         std::swap(*it, begin[offset]);
-      }
+      });
       return begin_offset != end_offset;
     });
   }
@@ -653,13 +714,11 @@ void ska_byte_sort(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t 
 void ska_sort_partition(NormalizedKeyRow* begin, NormalizedKeyRow* end, const size_t byte_index,
                         const size_t key_size) {
   if (byte_index >= std::min(sizeof(uint64_t), key_size)) {
-    // Prefix exhausted (only reached for keys longer than 8 bytes): order the ties by the key tail.
-    boost::sort::pdqsort(begin, end, [key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
-      return lhs.less_than(rhs, key_size);
-    });
+    // Prefix exhausted (only reached for keys longer than 8 bytes): DuckDB's next_sort orders the ties by the full key.
+    ska_std_sort_fallback(begin, end, key_size);
     return;
   }
-  if (static_cast<size_t>(end - begin) <= SKA_SORT_AMERICAN_FLAG_THRESHOLD) {
+  if (static_cast<size_t>(end - begin) < SKA_SORT_AMERICAN_FLAG_THRESHOLD) {
     ska_american_flag_sort(begin, end, byte_index, key_size);
   } else {
     ska_byte_sort(begin, end, byte_index, key_size);
@@ -685,8 +744,8 @@ void ska_sort_partition(NormalizedKeyRow* begin, NormalizedKeyRow* end, const si
 // Follows upstream in: the probe/expand loop, the strictness of both run directions (a descending run continues while
 // !(a < b), so stretches of equal keys are reversed: unstable), pairwise std::inplace_merge over a std::list of run
 // ends, and the n < 128 cutoff.
-// Deviation: upstream hard-codes pdqsort for the unsorted parts and for n < 128; here both go to `fallback`, which is
-// how DuckDB plugs in ska sort (whose own small-size path is pdqsort, so the n < 128 case ends in pdqsort as upstream).
+// Matches DuckDB v1.4.0's vendored third_party/vergesort/vergesort.h (random-access overload), which already takes a
+// `fallback` for the unsorted parts and for n < 128 instead of upstream's hard-coded pdqsort.
 //
 // `fallback(begin, end)` must sort [begin, end).
 // ---------------------------------------------------------------------------------------------------------------------
@@ -846,6 +905,8 @@ void vergesort(NormalizedKeyRow* first, NormalizedKeyRow* last, const size_t key
 
 // END_SORT_KERNELS (marker for standalone kernel tests)
 
+// BEGIN_MERGE_KERNELS (marker for standalone kernel tests)
+
 /**
  * Merge k sorted runs of NormalizedKeyRows into a single RowIDPosList using a loser tree.
  * tree[0] holds the index of the run with the overall smallest head element, internal nodes 1 .. leaf_count - 1 each
@@ -857,7 +918,7 @@ void vergesort(NormalizedKeyRow* first, NormalizedKeyRow* last, const size_t key
  */
 // Writes exactly `row_count` RowIDs, in sorted order, into `output` (fusing the extraction step; the caller points
 // `output` at the partition's slice of the final position list).
-void merge_partition_of_sorted_runs(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
+[[maybe_unused]] void merge_partition_of_sorted_runs(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
                                     const size_t key_size, const size_t row_count, RowID* output) {
   const auto run_count = runs.size();
   DebugAssert(run_count > 0, "Expected at least one run.");
@@ -931,6 +992,64 @@ void merge_partition_of_sorted_runs(const std::vector<std::pair<const Normalized
   }
 }
 
+// DuckDB v1.4.0's actual partition merge (SortedRunMergerLocalState::TemplatedMergePartition): concatenate the
+// partition's slice of every (non-empty) run into one buffer and sort it again. "Seems counter-intuitive to re-sort
+// instead of merging, but modern sorting algorithms detect and merge": vergesort finds the slices as runs (if each has
+// at least n / log2(n) rows; shorter ones are pdqsorted) and merges them pairwise with std::inplace_merge, i.e., a
+// cascaded two-way merge over a cache-resident buffer. With a single active run, the slice is already sorted and the
+// sort is skipped. Writes exactly `row_count` RowIDs, in sorted order, into `output`.
+// Deviation: DuckDB reuses one buffer per thread across partitions; here each partition allocates its own.
+[[maybe_unused]] void merge_partition_by_resorting(
+    const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
+    const size_t row_count, RowID* output) {
+  auto buffer = uninitialized_vector<NormalizedKeyRow>(row_count);
+  auto* buffer_end = buffer.data();
+  for (const auto& [run_begin, run_end] : runs) {
+    buffer_end = std::copy(run_begin, run_end, buffer_end);
+  }
+  DebugAssert(buffer_end == buffer.data() + row_count, "Partition slices must add up to the partition size.");
+
+  if (runs.size() > 1) {
+    // Same routine as ska sort's StdSortFallback: vergesort with pdqsort_branchless, full comparator.
+    ska_std_sort_fallback(buffer.data(), buffer_end, key_size);
+  }
+  for (const auto* row = buffer.data(); row != buffer_end; ++row) {
+    *output++ = row->row_id;
+  }
+}
+
+// Merges one output partition, given the partition's slice of every run that contributes to it.
+[[maybe_unused]] void merge_partition(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
+                     const size_t key_size, const size_t row_count, RowID* output) {
+  if constexpr (MERGE_ALGORITHM == MergeAlgorithm::ConcatVergesort) {
+    merge_partition_by_resorting(runs, key_size, row_count, output);
+  } else {
+    merge_partition_of_sorted_runs(runs, key_size, row_count, output);
+  }
+}
+
+// Output offsets of the merge partitions: partition p covers merged positions [offsets[p], offsets[p + 1]). Every
+// partition holds at least one row.
+std::vector<size_t> compute_merge_partition_offsets(const size_t row_count, const size_t worker_count) {
+  auto offsets = std::vector<size_t>{};
+  if constexpr (MERGE_PARTITIONING == MergePartitioning::FixedSize) {
+    const auto partition_size = (worker_count == 1) ? MERGE_PARTITION_SIZE_SINGLE_THREADED : MERGE_PARTITION_SIZE;
+    const auto partition_count = div_ceil(row_count, partition_size);
+    offsets.reserve(partition_count + 1);
+    for (auto partition = size_t{0}; partition < partition_count; ++partition) {
+      offsets.push_back(partition * partition_size);
+    }
+  } else {
+    const auto partition_count = std::clamp(worker_count, size_t{1}, row_count);
+    offsets.reserve(partition_count + 1);
+    for (auto partition = size_t{0}; partition < partition_count; ++partition) {
+      offsets.push_back(row_count * partition / partition_count);
+    }
+  }
+  offsets.push_back(row_count);
+  return offsets;
+}
+
 // K-way Merge Path: find how many elements of each run fall in the first `advance_by` merged outputs, i.e. the flat
 // frontier. Lower-run-index breaks ties, matching merge_partition_of_sorted_runs. NOTE: the peek is offset+step-1
 // (last element TAKEN), not the blog's offset+delta -- the latter is off-by-one on the flat-frontier condition.
@@ -973,9 +1092,10 @@ std::vector<size_t> compute_intersections(
   return intersections;
 }
 
-// Number of active workers of the scheduler. Used both as the number of sorted runs (one per worker, as DuckDB
-// generates one thread-local sorted run per thread) and as the number of merge-path partitions (so that the merge's
-// parallelism follows the machine instead of the input size). Falls back to 1 when no worker-based scheduler is set,
+// END_MERGE_KERNELS (marker for standalone kernel tests)
+
+// Number of active workers of the scheduler. Used as the number of sorted runs (one per worker, as DuckDB generates
+// one thread-local sorted run per thread) and, with MergePartitioning::PerWorker, as the number of merge partitions. Falls back to 1 when no worker-based scheduler is set,
 // i.e., single-threaded execution produces one run and needs no merge. Never exceeds row_count, so every run and every
 // partition holds at least one row.
 size_t determine_worker_count(const size_t row_count) {
@@ -989,17 +1109,20 @@ size_t determine_worker_count(const size_t row_count) {
 // Merge path for the k-way merge: compute the partition boundaries only, so that this phase can be timed separately
 // from the merge itself (OperatorSteps::MergePath vs. the merge step).
 //
-// boundaries[p][run] = elements of `run` consumed by output position row_count * p / partition_count. Two consecutive
-// boundaries bound one output partition. The first and last boundary are known without any comparisons; each internal
-// one is computed from zero in its own task, so the whole phase runs at the parallelism of the scheduler. The tasks
-// write to distinct elements of an already-sized vector, so no synchronization is needed.
+// boundaries[p][run] = elements of `run` consumed by output position partition_offsets[p]. Two consecutive boundaries
+// bound one output partition. The first and last boundary are known without any comparisons; each internal one is
+// computed from zero in its own task, so the whole phase runs at the parallelism of the scheduler. The tasks write to
+// distinct elements of an already-sized vector, so no synchronization is needed.
+// Deviation from DuckDB v1.4.0: DuckDB seeds each partition's search with the previous partition's boundary (a chain
+// of dependent searches, each bounded by the partition size); here every boundary starts from zero.
 std::vector<std::vector<size_t>> compute_merge_path_boundaries(
     const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
-    const size_t row_count, const size_t partition_count) {
+    const std::vector<size_t>& partition_offsets) {
   auto boundaries = std::vector<std::vector<size_t>>();
-  if (row_count == 0 || partition_count == 0) {
+  if (partition_offsets.size() < 2 || partition_offsets.back() == 0) {
     return boundaries;
   }
+  const auto partition_count = partition_offsets.size() - 1;
 
   const auto run_count = runs.size();
 
@@ -1018,7 +1141,7 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   boundary_tasks.reserve(partition_count - 1);
   for (auto partition = size_t{1}; partition < partition_count; ++partition) {
     boundary_tasks.emplace_back(std::make_shared<JobTask>([&, partition]() {
-      boundaries[partition] = compute_intersections(runs, key_size, row_count * partition / partition_count);
+      boundaries[partition] = compute_intersections(runs, key_size, partition_offsets[partition]);
     }));
   }
   Hyrise::get().scheduler()->schedule_and_wait_for_tasks(boundary_tasks);
@@ -1026,11 +1149,12 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   return boundaries;
 }
 
-// Parallel k-way merge: merge each output partition delimited by `boundaries` independently, writing RowIDs straight
-// into that partition's slice of the position list (reusing merge_partition_of_sorted_runs). Single pass over the
-// data. The boundaries are precomputed by compute_merge_path_boundaries so that the merge path is its own phase.
+// Parallel k-way merge: merge each output partition delimited by `boundaries` independently (MERGE_ALGORITHM),
+// writing RowIDs straight into that partition's slice of the position list. The boundaries are precomputed by
+// compute_merge_path_boundaries so that the merge path is its own phase.
 RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs,
                               const size_t key_size, const size_t row_count,
+                              const std::vector<size_t>& partition_offsets,
                               const std::vector<std::vector<size_t>>& boundaries) {
   auto position_list = RowIDPosList(row_count);
   if (row_count == 0) {
@@ -1046,8 +1170,8 @@ RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow
   merge_tasks.reserve(partitions_count);
   for (auto partition = size_t{0}; partition < partitions_count; ++partition) {
     merge_tasks.emplace_back(std::make_shared<JobTask>([&, partition]() {
-      const auto out_begin = row_count * partition / partitions_count;
-      const auto out_end = row_count * (partition + 1) / partitions_count;
+      const auto out_begin = partition_offsets[partition];
+      const auto out_end = partition_offsets[partition + 1];
       // #2: skip runs that contribute nothing to this partition, so the loser tree is only as deep as the live runs.
       auto sub_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
       sub_runs.reserve(run_count);
@@ -1059,7 +1183,7 @@ RowIDPosList merge_partitions(const std::vector<std::pair<const NormalizedKeyRow
         }
       }
       if (!sub_runs.empty()) {
-        merge_partition_of_sorted_runs(sub_runs, key_size, out_end - out_begin, position_list.data() + out_begin);
+        merge_partition(sub_runs, key_size, out_end - out_begin, position_list.data() + out_begin);
       }
     }));
   }
@@ -1613,15 +1737,15 @@ std::shared_ptr<const Table> Sort::_on_execute() {
                       materialized_rows.data() + run_offsets[run_index + 1]);
   }
 
-  // Merge path: one partition per active worker, computed as its own phase so that the cost of finding the
+  // Merge path: partitions per MERGE_PARTITIONING, computed as its own phase so that the cost of finding the
   // boundaries is reported separately from the cost of merging.
-  const auto merge_partition_count = worker_count;
-  const auto merge_path_boundaries =
-      compute_merge_path_boundaries(runs, normalized_key_size, row_count, merge_partition_count);
+  const auto merge_partition_offsets = compute_merge_partition_offsets(row_count, worker_count);
+  const auto merge_path_boundaries = compute_merge_path_boundaries(runs, normalized_key_size, merge_partition_offsets);
 
   const auto merge_path_time = timer.lap();
 
-  auto position_list = merge_partitions(runs, normalized_key_size, row_count, merge_path_boundaries);
+  auto position_list =
+      merge_partitions(runs, normalized_key_size, row_count, merge_partition_offsets, merge_path_boundaries);
 
   const auto merge_time = timer.lap();
 
