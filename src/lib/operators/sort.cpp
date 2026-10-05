@@ -73,11 +73,6 @@ auto div_ceil(const auto left, const auto right) {
   return (left + right - 1) / right;
 }
 
-// Returns the next multiple. If value is already a multiple, then return value.
-auto next_multiple(const auto value, const auto multiple) {
-  return div_ceil(value, multiple) * multiple;
-}
-
 // Given an unsorted_table and a pos_list that defines the output order, this materializes all columns in the table,
 // creating chunks of output_chunk_size rows at maximum.
 std::shared_ptr<Table> write_materialized_output_table(const std::shared_ptr<const Table>& unsorted_table,
@@ -797,9 +792,11 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   // TODO(student): Update performance metrics.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
-  step_performance_data.set_step_runtime(OperatorSteps::MaterializeSortColumns, materialization_time);
-  step_performance_data.set_step_runtime(OperatorSteps::TemporaryResultWriting, write_back_time);
-  step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
+  step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, materialization_time);
+  // Extracting the position list is part of the sort step. IPS4o sorts in-place and has no merge phase.
+  step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time + write_back_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, std::chrono::nanoseconds{0});
+  step_performance_data.set_step_runtime(OperatorSteps::MergePath, std::chrono::nanoseconds{0});
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
@@ -850,7 +847,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
     output_chunk->set_individually_sorted_by(final_sort_definition);
   }
 
-  step_performance_data.set_step_runtime(OperatorSteps::WriteOutput, timer.lap());
+  step_performance_data.set_step_runtime(OperatorSteps::ResultMaterialization, timer.lap());
   return sorted_table;
 }
 
