@@ -600,18 +600,28 @@ std::vector<size_t> ips4o_pass(SortRange<T> auto& sort_range, const size_t num_b
 
   // Create a range of empty elements at the end of each bucket.
   auto bucket_empty_tail = std::vector<std::ranges::subrange<RangeIterator>>(num_buckets);
+  // The overflow block is written by the bucket owning the last (partial) block of the array. This is not necessarily
+  // the last bucket, because trailing buckets may be empty.
+  auto overflow_bucket_owner = num_buckets - 1;
   for (auto bucket = size_t{0}; bucket < num_buckets; ++bucket) {
     const auto bucket_end_index = static_cast<int64_t>(aggregated_bucket_sizes[bucket]);
-    const auto bucket_block_begin = (bucket > 0) ? static_cast<size_t>(aligned_bucket_sizes[bucket - 1]) : 0;
+    const auto bucket_block_begin = (bucket > 0) ? static_cast<int64_t>(aligned_bucket_sizes[bucket - 1]) : int64_t{0};
     auto bucket_written_end_index = bucket_iterators[bucket].distance_to_start(sort_range);
 
-    if (bucket + 1 == num_buckets && !overflow_bucket.empty()) {
+    if (bucket_written_end_index > static_cast<int64_t>(total_size) && bucket_written_end_index > bucket_block_begin) {
+      DebugAssert(!overflow_bucket.empty(), "Bucket was written past the end without using the overflow bucket");
+      overflow_bucket_owner = bucket;
       bucket_written_end_index -= block_size;
     }
 
     const auto bucket_written_end = std::next(sort_range.begin(), bucket_written_end_index);
-    if (total_size <= bucket_block_begin) {
-      // Last bucket is empty.
+    if (bucket_end_index <= bucket_block_begin) {
+      // The bucket ends before its first aligned block, i.e., all its elements fit into the last (partial) block of
+      // the previous bucket and no blocks have been written for it. Its elements are only written to the start range,
+      // which must be limited to the bucket's actual end. Otherwise, the write pointer (bucket_block_begin) would be
+      // mistaken for overflowing elements and elements of the next bucket would be moved.
+      bucket_empty_start[bucket] =
+          std::ranges::subrange(bucket_empty_start[bucket].begin(), std::next(sort_range.begin(), bucket_end_index));
       bucket_empty_tail[bucket] = std::ranges::subrange(bucket_written_end, bucket_written_end);
     } else if (bucket_written_end_index > bucket_end_index) {
       DebugAssert(bucket + 1 != num_buckets, "This case should not happen for the last bucket");
@@ -643,7 +653,7 @@ std::vector<size_t> ips4o_pass(SortRange<T> auto& sort_range, const size_t num_b
     }
   }
   if (!overflow_bucket.empty()) {
-    write_to_ranges(overflow_bucket, bucket_empty_start.back(), bucket_empty_tail.back());
+    write_to_ranges(overflow_bucket, bucket_empty_start[overflow_bucket_owner], bucket_empty_tail[overflow_bucket_owner]);
   }
 
   if constexpr (HYRISE_DEBUG) {
