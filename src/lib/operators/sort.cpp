@@ -662,13 +662,52 @@ double estimated_cascade_level_cost_us(const size_t row_count) {
   return CASCADE_LEVEL_COST_PER_ROW_US * static_cast<double>(row_count);
 }
 
-// Number of groups one cascade level splits `run_count` runs into: one per worker, so the level runs at full occupancy
-// and leaves exactly as many runs as the final merge has partitions. Reducing further would only idle workers during
-// the level; reducing less would leave the merge path more runs than it needs to see. Returns `run_count` when no
-// reduction is possible, which the caller reads as "stop cascading".
-size_t cascade_group_count(const size_t run_count, const size_t worker_count) {
-  const auto groups = std::min(worker_count, run_count);
-  return std::clamp(groups, std::min(size_t{2}, run_count), run_count);
+// Maximum fan-in of one cascade merge: the most runs a single loser tree may merge in a level. This is what makes the
+// cascade multi-level. Without it a single level of one group per worker always lands exactly on `worker_count` runs
+// whatever the input was, and no further level could reduce anything, so the cap is the only reason depth exists.
+//
+// A run-to-worker ratio at or below the cap therefore needs one level; the cascade only deepens once the ratio exceeds
+// it, i.e. once run_count > worker_count * cap. The cap also bounds the concurrent input streams one tree reads --
+// prefetchers track a few dozen, each run holds a TLB entry, and every comparison dereferences a run head's key bytes
+// in its chunk allocation.
+constexpr size_t CASCADE_FAN_IN_CAP = 4;
+
+// Number of levels needed to bring `run_count` down to `worker_count` with no level exceeding the fan-in cap. Zero
+// means a flat merge: the runs already fit the final merge path.
+size_t cascade_level_count(const size_t run_count, const size_t worker_count, const size_t fan_in_cap) {
+  // worker_count < 2 means the merge is serial anyway: a level would reduce every run into a single one and then the
+  // final merge would walk it again, so the pass buys nothing.
+  if (run_count <= worker_count || fan_in_cap < 2 || worker_count < 2) {
+    return 0;
+  }
+  auto level_count = size_t{0};
+  auto live_count = run_count;
+  while (live_count > worker_count) {
+    live_count = div_ceil(live_count, fan_in_cap);
+    ++level_count;
+  }
+  return level_count;
+}
+
+// Group count for one level of a plan that still has `remaining_levels` levels to run. The levels are balanced: each
+// reduces the run count by the same factor, so the descent to `worker_count` spreads evenly instead of taking one wide
+// level and then several trivial ones. The last level always lands on exactly `worker_count` groups, which is both
+// full occupancy and the number of runs the final merge path wants to see.
+size_t cascade_group_count(const size_t run_count, const size_t worker_count, const size_t remaining_levels) {
+  const auto floor_groups = std::min(worker_count, run_count);
+  if (remaining_levels <= 1 || floor_groups >= run_count) {
+    return floor_groups;
+  }
+  const auto reduction_per_level = std::pow(static_cast<double>(run_count) / static_cast<double>(floor_groups),
+                                            1.0 / static_cast<double>(remaining_levels));
+  auto groups = (reduction_per_level > 1.0)
+                    ? static_cast<size_t>(std::ceil(static_cast<double>(run_count) / reduction_per_level))
+                    : floor_groups;
+  groups = std::clamp(groups, floor_groups, run_count);
+  if (groups >= run_count) {
+    groups = floor_groups;  // rounding left no reduction; fall back to the floor, which always makes progress
+  }
+  return groups;
 }
 
 // One cascade level: split `runs` into `group_count` contiguous, balanced groups and merge each group with its own
@@ -1280,9 +1319,10 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   const auto sort_time = timer.lap();
 
   // Merge the chunk runs into the final position list:
-  //   1. Cascade: while a level would remove more merge-path time than it costs (see estimated_merge_path_cost_us
-  //      and estimated_cascade_level_cost_us), merge the runs in one contiguous group per worker, one task each and
-  //      no merge path (see merge_cascade_level). Levels ping-pong between sort_scratch (dead since run generation) and
+  //   1. Cascade: bring the runs down to the worker count over ceil(log_cap(runs / workers)) balanced levels, each
+  //      merging contiguous groups of at most CASCADE_FAN_IN_CAP runs with one task per group and no merge path
+  //      (see merge_cascade_level). The whole descent is run only if it removes more merge-path time than all its
+  //      levels cost. Levels ping-pong between sort_scratch (dead since run generation) and
   //      materialized_rows (fully consumed by the first level), so the cascade allocates nothing: the key bytes live
   //      in the chunk allocations and never move, only the row records do.
   //   2. Merge path over the remaining runs, one partition per active worker.
@@ -1298,30 +1338,35 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   const auto worker_count = merge_worker_count();
   const auto merge_partition_count = determine_merge_partition_count(row_count);
 
-  // Run a level only while the merge-path time it removes is worth more than the level costs. The saving is the
-  // difference between the merge path over the runs we have and over the runs the level would leave, so the predicate
-  // is monotone in the run count: more runs can only make a level more attractive, which keeps neighbouring inputs
-  // from taking different strategies.
-  const auto cascade_wanted = [&]() {
-    const auto live_count = runs.size();
-    const auto group_count = cascade_group_count(live_count, worker_count);
-    if (group_count >= live_count) {
-      return false;
-    }
-    const auto saved = estimated_merge_path_cost_us(live_count, row_count, merge_partition_count) -
-                       estimated_merge_path_cost_us(group_count, row_count, merge_partition_count);
-    return saved > CASCADE_COST_MARGIN * estimated_cascade_level_cost_us(row_count);
-  };
+  // Decide the whole descent at once rather than one level at a time. A greedy per-level test can accept a first
+  // level and then reject its successor, leaving the run count stranded between the input and the worker count --
+  // worse than either doing nothing or going all the way. So the saving of the complete plan (the merge path over the
+  // runs we have, less the merge path over the runs the plan would leave) is weighed against the cost of every level
+  // the plan needs.
+  const auto planned_level_count = cascade_level_count(runs.size(), worker_count, CASCADE_FAN_IN_CAP);
+  const auto cascade_saving_us =
+      estimated_merge_path_cost_us(runs.size(), row_count, merge_partition_count) -
+      estimated_merge_path_cost_us(std::min(worker_count, runs.size()), row_count, merge_partition_count);
+  const auto cascade_cost_us =
+      static_cast<double>(planned_level_count) * estimated_cascade_level_cost_us(row_count);
 
-  if (cascade_wanted() && sort_scratch.size() < row_count) {
+  auto remaining_levels =
+      (planned_level_count > 0 && cascade_saving_us > CASCADE_COST_MARGIN * cascade_cost_us) ? planned_level_count : 0;
+
+  if (remaining_levels > 0 && sort_scratch.size() < row_count) {
     sort_scratch = uninitialized_vector<NormalizedKeyRow>(row_count);  // only without radix run generation
   }
 
   auto* level_output = sort_scratch.data();
   auto* level_spare = materialized_rows.data();
-  while (cascade_wanted()) {
-    runs = merge_cascade_level(runs, normalized_key_size, cascade_group_count(runs.size(), worker_count), level_output);
+  while (remaining_levels > 0) {
+    const auto group_count = cascade_group_count(runs.size(), worker_count, remaining_levels);
+    if (group_count >= runs.size()) {
+      break;
+    }
+    runs = merge_cascade_level(runs, normalized_key_size, group_count, level_output);
     std::swap(level_output, level_spare);
+    --remaining_levels;
   }
 
   const auto cascade_time = timer.lap();
