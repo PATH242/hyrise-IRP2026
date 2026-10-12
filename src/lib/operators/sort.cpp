@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -620,16 +621,106 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   return boundaries;
 }
 
-// Number of sorted runs that run generation produces (run coalescing). The materialized rows are one contiguous array
-// in input order, so a run is simply a contiguous slice of it and need not respect chunk boundaries: run g covers rows
-// [N * g / G, N * (g + 1) / G), which makes every run the same size up to one row. Each run is sorted by one task
-// (radix or pdqsort, see USE_RADIX_SORT), and the merge then combines the G runs in a single partitioned k-way pass.
+// Target run count for the merge path, i.e. how far the cascade reduces the runs before partitioning. This is the
+// adaptive variant of the fan-in cap: rather than bounding a loser tree's width, it bounds the input of the one step
+// whose cost actually grows superlinearly in the run count -- the merge path.
 //
-// The default is one run per worker, so run generation fills the machine and the merge sees exactly W runs. This is
-// the single place to change the policy -- e.g. return chunk_count for the previous one-run-per-chunk behaviour, or a
-// multiple of the worker count for more, smaller runs. Clamped to [1, row_count] by the caller.
-size_t determine_run_count(const size_t /*row_count*/, const size_t /*chunk_count*/, const size_t worker_count) {
-  return worker_count;
+// Computing one partition boundary from zero advances the frontier by roughly R/k elements per scan of all R runs, so
+// a boundary costs O(R^2 * log(N/P)) comparisons and the whole phase O(P * R^2 * log(N/P)), while the merge itself is
+// only O(N * log2 R). Measured on sidon (TPC-H SF1 and SF10, TPC-DS catalog_sales; R = 92, 220 and 916 runs over
+// N = 6M, 14.4M and 60M rows) the merge path follows
+//
+//     MERGE_PATH ~ a * P * R^2 * ln(N / P),   a ~ 1e-3 us,
+//     MERGE      ~ b * N * log2(R),           b ~ 2e-3 us,
+//
+// with `a` varying by less than 2x across a hundredfold range of R^2. Requiring the merge path to stay at a fraction
+// THETA of the merge and solving for R gives a target that grows with the square root of the rows per partition; over
+// the measured range the solution is within one percent of
+//
+//     R_target ~ MERGE_PATH_RUN_TARGET_COEFFICIENT * sqrt(N / P).
+//
+// Consequences worth knowing before reading results: the target is ~81 runs at SF1, ~260 at SF10 and ~830 at SF100,
+// so a fixed cap in the tens is far below it at every scale we run; and since one level with `worker_count` groups
+// always lands at `worker_count` runs, a second level is needed only when the machine has more workers than the
+// target allows, which on sidon means inputs below ~13M rows -- where the cascade does not trigger at all.
+double merge_path_run_target(const size_t row_count, const size_t worker_count) {
+  constexpr auto MERGE_PATH_RUN_TARGET_COEFFICIENT = 0.37;
+  return MERGE_PATH_RUN_TARGET_COEFFICIENT *
+         std::sqrt(static_cast<double>(row_count) / static_cast<double>(std::max(worker_count, size_t{1})));
+}
+
+// Hysteresis on the decision to cascade at all. A run count just above the target does not justify a full extra pass
+// over every row, so the cascade starts only once the run count exceeds the target by this factor. Without it the
+// pipeline would have a discontinuity: one run more than the target would add a pass that moves 100% of the data.
+constexpr double CASCADE_HYSTERESIS = 1.5;
+
+// Number of groups one cascade level splits `run_count` runs into. Two lower bounds meet here:
+//   * ceil(run_count / target) is what the merge path needs -- enough groups that the level's output is at or below
+//     the target.
+//   * worker_count is what the machine needs. The first bound alone can be tiny (3 groups for 92 runs at a target of
+//     32), which would run a level at a fraction of the available parallelism while still moving every row. Taking
+//     the larger of the two keeps the traffic identical and the trees narrower, at full occupancy.
+// Returns `run_count` itself when no reduction is possible, which the caller reads as "stop cascading".
+size_t cascade_group_count(const size_t run_count, const size_t worker_count, const double run_target) {
+  const auto target = std::max(size_t{2}, static_cast<size_t>(run_target));
+  const auto groups = std::max(div_ceil(run_count, target), std::min(worker_count, run_count));
+  // At least two groups, so a level that runs always merges something; never more groups than runs, so a level that
+  // cannot reduce reports run_count and the caller stops.
+  return std::clamp(groups, std::min(size_t{2}, run_count), run_count);
+}
+
+// One cascade level: split `runs` into `group_count` contiguous, balanced groups and merge each group with its own
+// loser tree, one task per group, no merge path. Each group's
+// result is written to `output` at the position its rows occupy in merged order (the prefix sum of the group sizes),
+// so the next level's runs again lie contiguously and in run order. Returns those runs.
+//
+// Groups are contiguous in run order and every loser tree breaks ties by lowest index, so a row from an earlier run
+// still precedes an equal row from a later run after any number of levels: the cascade is as stable as a single merge.
+std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>> merge_cascade_level(
+    const std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>& runs, const size_t key_size,
+    const size_t group_count, NormalizedKeyRow* output) {
+  const auto run_count = runs.size();
+  DebugAssert(group_count > 1 && group_count < run_count, "A level must reduce the run count to more than one run.");
+
+  const auto group_first_run = [&](const size_t group) {
+    return run_count * group / group_count;
+  };
+
+  auto group_offsets = std::vector<size_t>(group_count + 1, 0);
+  for (auto group = size_t{0}; group < group_count; ++group) {
+    const auto first_run = group_first_run(group);
+    const auto last_run = group_first_run(group + 1);
+    DebugAssert(first_run < last_run, "Balanced grouping must not produce an empty group.");
+    auto group_row_count = size_t{0};
+    for (auto run = first_run; run < last_run; ++run) {
+      group_row_count += static_cast<size_t>(runs[run].second - runs[run].first);
+    }
+    group_offsets[group + 1] = group_offsets[group] + group_row_count;
+  }
+
+  // Every group is merged (and therefore copied) even if it holds a single run: the level writes the whole row range
+  // of `output`, so a run left in place could be overwritten once the buffers ping-pong. With balanced groups of
+  // ceil(run_count / fan_in) this costs nothing in practice -- a singleton group cannot occur unless the run count is
+  // below twice the group count.
+  auto merged_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(group_count);
+  auto merge_tasks = std::vector<std::shared_ptr<AbstractTask>>();
+  merge_tasks.reserve(group_count);
+  for (auto group = size_t{0}; group < group_count; ++group) {
+    const auto first_run = group_first_run(group);
+    const auto last_run = group_first_run(group + 1);
+    auto* group_output = output + group_offsets[group];
+    merged_runs[group] = {group_output, group_output + (group_offsets[group + 1] - group_offsets[group])};
+
+    merge_tasks.emplace_back(std::make_shared<JobTask>([&, group, first_run, last_run, group_output]() {
+      auto group_runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>(
+          runs.begin() + static_cast<std::ptrdiff_t>(first_run), runs.begin() + static_cast<std::ptrdiff_t>(last_run));
+      merge_partition_of_sorted_runs(group_runs, key_size, group_offsets[group + 1] - group_offsets[group],
+                                     group_output);
+    }));
+  }
+  Hyrise::get().scheduler()->schedule_and_wait_for_tasks(merge_tasks);
+
+  return merged_runs;
 }
 
 // Merge each output partition delimited by `boundaries` independently, writing
@@ -1159,28 +1250,20 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto materialization_time = timer.lap();
 
-  // Run generation with run coalescing: split the materialized rows into G contiguous, equally sized runs (see
-  // determine_run_count) and sort each with one task. Runs ignore chunk boundaries -- the rows are one array in input
-  // order, so a slice is all a run needs, and equal slices keep the tasks balanced. Radix sort vs. pdqsort is selected
-  // via USE_RADIX_SORT; the scratch buffer is only needed by radix and is sliced the same way.
-  const auto row_count = materialized_rows.size();
-  const auto worker_count = merge_worker_count();
-  const auto run_count =
-      std::clamp(determine_run_count(row_count, static_cast<size_t>(chunk_count), worker_count), size_t{1}, row_count);
-  const auto run_begin_offset = [&](const size_t run_index) {
-    return row_count * run_index / run_count;
-  };
+  // Scratch buffer for the radix run generation. Dead once the runs are sorted, so the merge cascade reuses it as one
+  // of its two ping-pong buffers (see below).
+  auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(USE_RADIX_SORT ? input_table->row_count() : size_t{0});
 
-  auto sort_scratch = uninitialized_vector<NormalizedKeyRow>(USE_RADIX_SORT ? row_count : size_t{0});
-
+  // Sort each chunk's slice of the materialized rows independently and in parallel. Every chunk becomes a sorted run
+  // for the subsequent merge (run generation / sink phase). Radix sort vs. pdqsort is selected via USE_RADIX_SORT.
   auto sort_run_tasks = std::vector<std::shared_ptr<AbstractTask>>();
-  sort_run_tasks.reserve(run_count);
-  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
+  sort_run_tasks.reserve(chunk_count);
+  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
     sort_run_tasks.emplace_back(std::make_shared<JobTask>([&, run_index]() {
-      auto* run_begin = materialized_rows.data() + run_begin_offset(run_index);
-      auto* run_end = materialized_rows.data() + run_begin_offset(run_index + 1);
+      auto* run_begin = materialized_rows.data() + chunk_offsets[run_index];
+      auto* run_end = materialized_rows.data() + chunk_offsets[run_index + 1];
       if constexpr (USE_RADIX_SORT) {
-        auto* run_scratch = sort_scratch.data() + run_begin_offset(run_index);
+        auto* run_scratch = sort_scratch.data() + chunk_offsets[run_index];
         radix_sort(run_begin, run_end, run_scratch, normalized_key_size);
       } else {
         boost::sort::pdqsort(run_begin, run_end,
@@ -1194,15 +1277,49 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto sort_time = timer.lap();
 
-  // Merge the G sorted runs in one pass: merge path splits the output into one partition per active worker, and each
-  // partition is merged by its own loser tree, writing RowIDs straight into the position list.
+  // Merge the chunk runs into the final position list:
+  //   1. Cascade: while the run count exceeds the merge-path target (see merge_path_run_target) by more than
+  //      CASCADE_HYSTERESIS, merge the runs in independent contiguous groups, one task per group and no merge path
+  //      (see merge_cascade_level). The group count is the larger of what the target needs and what fills the
+  //      workers, so a level never runs narrow. Levels ping-pong between sort_scratch (dead since run generation) and
+  //      materialized_rows (fully consumed by the first level), so the cascade allocates nothing: the key bytes live
+  //      in the chunk allocations and never move, only the row records do.
+  //   2. Merge path over the remaining runs, one partition per active worker.
+  //   3. Final merge: each partition is merged by its own loser tree, writing RowIDs into the position list.
+  const auto row_count = materialized_rows.size();
   auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
-  runs.reserve(run_count);
-  for (auto run_index = size_t{0}; run_index < run_count; ++run_index) {
-    runs.emplace_back(materialized_rows.data() + run_begin_offset(run_index),
-                      materialized_rows.data() + run_begin_offset(run_index + 1));
+  runs.reserve(chunk_count);
+  for (auto run_index = size_t{0}; run_index < chunk_count; ++run_index) {
+    runs.emplace_back(materialized_rows.data() + chunk_offsets[run_index],
+                      materialized_rows.data() + chunk_offsets[run_index + 1]);
   }
 
+  const auto worker_count = merge_worker_count();
+  const auto run_target = merge_path_run_target(row_count, worker_count);
+  const auto cascade_threshold = CASCADE_HYSTERESIS * run_target;
+
+  const auto cascade_wanted = [&]() {
+    const auto live_count = runs.size();
+    return static_cast<double>(live_count) > cascade_threshold &&
+           cascade_group_count(live_count, worker_count, run_target) < live_count;
+  };
+
+  if (cascade_wanted() && sort_scratch.size() < row_count) {
+    sort_scratch = uninitialized_vector<NormalizedKeyRow>(row_count);  // only without radix run generation
+  }
+
+  auto* level_output = sort_scratch.data();
+  auto* level_spare = materialized_rows.data();
+  while (cascade_wanted()) {
+    runs = merge_cascade_level(runs, normalized_key_size,
+                               cascade_group_count(runs.size(), worker_count, run_target), level_output);
+    std::swap(level_output, level_spare);
+  }
+
+  const auto cascade_time = timer.lap();
+
+  // Merge path: one partition per active worker, computed as its own phase so that the cost of finding the boundaries
+  // is reported separately from the cost of merging.
   const auto merge_partition_count = determine_merge_partition_count(row_count);
   const auto merge_path_boundaries =
       compute_merge_path_boundaries(runs, normalized_key_size, row_count, merge_partition_count);
@@ -1211,16 +1328,16 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   auto position_list = merge_partitions(runs, normalized_key_size, row_count, merge_path_boundaries);
 
-  const auto merge_time = timer.lap();
+  const auto final_merge_time = timer.lap();
 
-  // Note: KeyMaterialization covers the column scan, long-string sort and key normalization, Sort the run generation
-  // (including coalescing into G runs), MergePath the merge-path boundaries, MergeTime the partitioned merge (which
-  // also writes the temporary result, i.e., the position list), and ResultMaterialization the payload gather.
+  // Note: KeyMaterialization covers the column scan, long-string sort and key normalization. Sort covers the parallel
+  // run generation, MergePath the merge-path boundaries, and MergeTime all merging (the cascade levels plus the
+  // partitioned final merge, which writes the position list). ResultMaterialization covers the output table.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
   step_performance_data.set_step_runtime(OperatorSteps::KeyMaterialization, materialization_time);
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
-  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, merge_time);
+  step_performance_data.set_step_runtime(OperatorSteps::MergeTime, cascade_time + final_merge_time);
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
