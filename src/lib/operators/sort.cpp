@@ -4,7 +4,6 @@
 #include <array>
 #include <bit>
 #include <chrono>
-#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -563,22 +562,14 @@ std::vector<size_t> compute_intersections(
 }
 
 // Number of workers the merge can occupy. Falls back to one when no worker-based scheduler is set, which keeps every
-// merge step correct and serial. Shared by the level cascade (whether a level of independent merges pays for itself)
-// and the merge path (how many partitions the final merge is split into), so both decisions see the same number.
-//
-// This counts the scheduler's workers, NOT active_worker_count(). The latter reports how many workers are executing a
-// task at the instant of the call, so it is a live value that depends on what else the scheduler happens to be running
-// -- it reads far below the machine's width when the Sort operator asks from an otherwise idle plan. Feeding it into a
-// threshold made the partition count and the cascade decision non-reproducible: two neighbouring inputs could take
-// different merge strategies for no reason in the data.
+// merge step correct and serial. Shared by the level cascade (whether a level of independent merges fills the machine)
+// and the merge path (how many partitions the finish is split into), so both decisions see the same number.
 size_t merge_worker_count() {
+  auto worker_count = size_t{1};
   if (const auto node_queue_scheduler = std::dynamic_pointer_cast<NodeQueueScheduler>(Hyrise::get().scheduler())) {
-    const auto total_worker_count = node_queue_scheduler->workers().size();
-    if (total_worker_count > 0) {
-      return total_worker_count;
-    }
+    worker_count = std::max(size_t{1}, static_cast<size_t>(node_queue_scheduler->active_worker_count()));
   }
-  return 1;
+  return worker_count;
 }
 
 // Number of merge-path partitions: one per active worker, so that the merge's parallelism follows the machine instead
@@ -629,89 +620,24 @@ std::vector<std::vector<size_t>> compute_merge_path_boundaries(
   return boundaries;
 }
 
-// Whether to spend a cascade level is decided by comparing two modelled costs rather than by thresholding the run
-// count. A level is worth running exactly when the merge-path time it removes exceeds the time the level itself costs,
-// and both sides are measurable:
+// Maximum fan-in of a single k-way merge in the cascade: the largest number of runs one loser tree merges at once.
+// The cascade repeats levels while more runs than this are left, so the level count follows from the chunk count
+// rather than being fixed: R runs need ceil(log_fanin(R)) levels, and each level merges ceil(runs / fan_in) groups.
 //
-//   merge path   ~ A * P * R^2 * ln(N / P)      boundaries are computed from zero, so advancing a frontier by N/P
-//                                               output elements scans all R runs about R times
-//   one level    ~ L * N                        every row is read and written once as a NormalizedKeyRow
+// The cap exists to keep a merge's concurrent input streams bounded. What limits a wide loser tree is not cache
+// capacity (the tree arrays are ~3 * k * 8 bytes) but the number of simultaneous sequential streams: hardware
+// prefetchers track a few dozen, each run also occupies a TLB entry, and every comparison dereferences the run head's
+// key bytes in its chunk allocation. A cap in the tens keeps all of that within what one core sustains.
 //
-// Fitted on sidon from the runs that partition over every chunk run (TPC-H SF1 and SF10, TPC-DS catalog_sales;
-// R = 92, 220 and 916 over N = 6M, 14.4M and 60M rows), A varies by under 2x across a hundredfold range of R^2, and L
-// comes from the measured gap between a flat merge and a single-level one at SF1. Both were measured while the worker
-// count was read from a live counter, so they are provisional: refit them once the phase columns are reproducible.
-// Only their ratio matters for the decision, which is why they sit next to each other here.
-constexpr double MERGE_PATH_COST_COEFFICIENT = 3.6e-3;   // A, microseconds
-constexpr double CASCADE_LEVEL_COST_PER_ROW_US = 6.7e-3; // L, microseconds per row
-
-// A level must beat its own cost by this margin before it runs. Without it the pipeline would churn one full pass over
-// the data to buy a saving of the same size, and the decision would sit on a knife edge where model error decides it.
-constexpr double CASCADE_COST_MARGIN = 1.2;
-
-// Modelled cost of computing all partition boundaries over `run_count` runs.
-double estimated_merge_path_cost_us(const size_t run_count, const size_t row_count, const size_t partition_count) {
-  const auto rows_per_partition =
-      std::max(2.0, static_cast<double>(row_count) / static_cast<double>(std::max(partition_count, size_t{1})));
-  const auto runs = static_cast<double>(run_count);
-  return MERGE_PATH_COST_COEFFICIENT * static_cast<double>(partition_count) * runs * runs * std::log(rows_per_partition);
+// This is the single place to change the policy -- return a value >= run_count to skip the cascade entirely (single
+// partitioned merge over every chunk run, i.e. the previous behaviour), or derive it from the cache or the key width.
+size_t determine_merge_fan_in(const size_t /*run_count*/, const size_t /*row_count*/, const size_t /*worker_count*/) {
+  constexpr auto MAX_MERGE_FAN_IN = size_t{32};
+  return MAX_MERGE_FAN_IN;
 }
 
-// Modelled cost of one cascade level, which moves every row exactly once.
-double estimated_cascade_level_cost_us(const size_t row_count) {
-  return CASCADE_LEVEL_COST_PER_ROW_US * static_cast<double>(row_count);
-}
-
-// Maximum fan-in of one cascade merge: the most runs a single loser tree may merge in a level. This is what makes the
-// cascade multi-level. Without it a single level of one group per worker always lands exactly on `worker_count` runs
-// whatever the input was, and no further level could reduce anything, so the cap is the only reason depth exists.
-//
-// A run-to-worker ratio at or below the cap therefore needs one level; the cascade only deepens once the ratio exceeds
-// it, i.e. once run_count > worker_count * cap. The cap also bounds the concurrent input streams one tree reads --
-// prefetchers track a few dozen, each run holds a TLB entry, and every comparison dereferences a run head's key bytes
-// in its chunk allocation.
-constexpr size_t CASCADE_FAN_IN_CAP = 4;
-
-// Number of levels needed to bring `run_count` down to `worker_count` with no level exceeding the fan-in cap. Zero
-// means a flat merge: the runs already fit the final merge path.
-size_t cascade_level_count(const size_t run_count, const size_t worker_count, const size_t fan_in_cap) {
-  // worker_count < 2 means the merge is serial anyway: a level would reduce every run into a single one and then the
-  // final merge would walk it again, so the pass buys nothing.
-  if (run_count <= worker_count || fan_in_cap < 2 || worker_count < 2) {
-    return 0;
-  }
-  auto level_count = size_t{0};
-  auto live_count = run_count;
-  while (live_count > worker_count) {
-    live_count = div_ceil(live_count, fan_in_cap);
-    ++level_count;
-  }
-  return level_count;
-}
-
-// Group count for one level of a plan that still has `remaining_levels` levels to run. The levels are balanced: each
-// reduces the run count by the same factor, so the descent to `worker_count` spreads evenly instead of taking one wide
-// level and then several trivial ones. The last level always lands on exactly `worker_count` groups, which is both
-// full occupancy and the number of runs the final merge path wants to see.
-size_t cascade_group_count(const size_t run_count, const size_t worker_count, const size_t remaining_levels) {
-  const auto floor_groups = std::min(worker_count, run_count);
-  if (remaining_levels <= 1 || floor_groups >= run_count) {
-    return floor_groups;
-  }
-  const auto reduction_per_level = std::pow(static_cast<double>(run_count) / static_cast<double>(floor_groups),
-                                            1.0 / static_cast<double>(remaining_levels));
-  auto groups = (reduction_per_level > 1.0)
-                    ? static_cast<size_t>(std::ceil(static_cast<double>(run_count) / reduction_per_level))
-                    : floor_groups;
-  groups = std::clamp(groups, floor_groups, run_count);
-  if (groups >= run_count) {
-    groups = floor_groups;  // rounding left no reduction; fall back to the floor, which always makes progress
-  }
-  return groups;
-}
-
-// One cascade level: split `runs` into `group_count` contiguous, balanced groups and merge each group with its own
-// loser tree, one task per group, no merge path. Each group's
+// One cascade level: split `runs` into `group_count` contiguous, balanced groups -- so every group holds at most
+// `fan_in` runs -- and merge each group with its own loser tree, one task per group, no merge path. Each group's
 // result is written to `output` at the position its rows occupy in merged order (the prefix sum of the group sizes),
 // so the next level's runs again lie contiguously and in run order. Returns those runs.
 //
@@ -1319,13 +1245,12 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   const auto sort_time = timer.lap();
 
   // Merge the chunk runs into the final position list:
-  //   1. Cascade: bring the runs down to the worker count over ceil(log_cap(runs / workers)) balanced levels, each
-  //      merging contiguous groups of at most CASCADE_FAN_IN_CAP runs with one task per group and no merge path
-  //      (see merge_cascade_level). The whole descent is run only if it removes more merge-path time than all its
-  //      levels cost. Levels ping-pong between sort_scratch (dead since run generation) and
+  //   1. Cascade: while more than `fan_in` runs are left, merge them in ceil(runs / fan_in) independent groups of at
+  //      most `fan_in` runs each, one task per group and no merge path (see merge_cascade_level). The level count
+  //      follows from the chunk count. Levels ping-pong between sort_scratch (dead since run generation) and
   //      materialized_rows (fully consumed by the first level), so the cascade allocates nothing: the key bytes live
   //      in the chunk allocations and never move, only the row records do.
-  //   2. Merge path over the remaining runs, one partition per active worker.
+  //   2. Merge path over the <= `fan_in` runs that are left, one partition per active worker.
   //   3. Final merge: each partition is merged by its own loser tree, writing RowIDs into the position list.
   const auto row_count = materialized_rows.size();
   auto runs = std::vector<std::pair<const NormalizedKeyRow*, const NormalizedKeyRow*>>();
@@ -1336,43 +1261,23 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   }
 
   const auto worker_count = merge_worker_count();
-  const auto merge_partition_count = determine_merge_partition_count(row_count);
-
-  // Decide the whole descent at once rather than one level at a time. A greedy per-level test can accept a first
-  // level and then reject its successor, leaving the run count stranded between the input and the worker count --
-  // worse than either doing nothing or going all the way. So the saving of the complete plan (the merge path over the
-  // runs we have, less the merge path over the runs the plan would leave) is weighed against the cost of every level
-  // the plan needs.
-  const auto planned_level_count = cascade_level_count(runs.size(), worker_count, CASCADE_FAN_IN_CAP);
-  const auto cascade_saving_us =
-      estimated_merge_path_cost_us(runs.size(), row_count, merge_partition_count) -
-      estimated_merge_path_cost_us(std::min(worker_count, runs.size()), row_count, merge_partition_count);
-  const auto cascade_cost_us =
-      static_cast<double>(planned_level_count) * estimated_cascade_level_cost_us(row_count);
-
-  auto remaining_levels =
-      (planned_level_count > 0 && cascade_saving_us > CASCADE_COST_MARGIN * cascade_cost_us) ? planned_level_count : 0;
-
-  if (remaining_levels > 0 && sort_scratch.size() < row_count) {
+  const auto merge_fan_in = determine_merge_fan_in(runs.size(), row_count, worker_count);
+  if (merge_fan_in >= 2 && runs.size() > merge_fan_in && sort_scratch.size() < row_count) {
     sort_scratch = uninitialized_vector<NormalizedKeyRow>(row_count);  // only without radix run generation
   }
 
   auto* level_output = sort_scratch.data();
   auto* level_spare = materialized_rows.data();
-  while (remaining_levels > 0) {
-    const auto group_count = cascade_group_count(runs.size(), worker_count, remaining_levels);
-    if (group_count >= runs.size()) {
-      break;
-    }
-    runs = merge_cascade_level(runs, normalized_key_size, group_count, level_output);
+  while (merge_fan_in >= 2 && runs.size() > merge_fan_in) {
+    runs = merge_cascade_level(runs, normalized_key_size, div_ceil(runs.size(), merge_fan_in), level_output);
     std::swap(level_output, level_spare);
-    --remaining_levels;
   }
 
   const auto cascade_time = timer.lap();
 
   // Merge path: one partition per active worker, computed as its own phase so that the cost of finding the boundaries
   // is reported separately from the cost of merging.
+  const auto merge_partition_count = determine_merge_partition_count(row_count);
   const auto merge_path_boundaries =
       compute_merge_path_boundaries(runs, normalized_key_size, row_count, merge_partition_count);
 
