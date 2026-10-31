@@ -49,13 +49,22 @@
 #include "utils/assert.hpp"
 #include "utils/ips4o_sort.hpp"
 #include "utils/timer.hpp"
+#include <sched.h>
 
 namespace {
-
-using namespace hyrise;  // NOLINT
-
-constexpr size_t STRING_CUTOFF = 64;
-
+  
+  using namespace hyrise;  // NOLINT
+  
+  constexpr size_t STRING_CUTOFF = 64;
+  
+static size_t usable_cpus() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+      return static_cast<size_t>(CPU_COUNT(&set));
+    }
+    return std::thread::hardware_concurrency();   // fallback
+}
 /**
  *        ____  _  _  __  ____  ____   __  ____   ___
  *       (    \( \/ )/  \(    \(___ \ /  \(___ \ / __)
@@ -852,7 +861,7 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 }
 
 Sort::Config::Config()
-    : max_parallelism(std::thread::hardware_concurrency()),
+    : max_parallelism(usable_cpus()),
       block_size(256),
       bucket_count(max_parallelism * 2),
       samples_per_classifier(4),
