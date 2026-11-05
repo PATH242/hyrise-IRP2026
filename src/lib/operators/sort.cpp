@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <functional>
@@ -614,6 +616,27 @@ std::shared_ptr<AbstractOperator> Sort::_on_deep_copy(
 
 void Sort::_on_set_parameters(const std::unordered_map<ParameterID, AllTypeVariant>& parameters) {}
 
+// W2 experiment: with HYRISE_SORT_DUMP_LIST=<file>, the final position list is written (raw RowIDs, once per process).
+namespace {
+
+void dump_position_list_once(const RowIDPosList& position_list) {
+  static const auto* const path = std::getenv("HYRISE_SORT_DUMP_LIST");
+  static auto dumped = false;
+  if (path == nullptr || dumped) {
+    return;
+  }
+  dumped = true;
+  static_assert(sizeof(RowID) == 8 && std::is_trivially_copyable_v<RowID>);
+  auto* file = std::fopen(path, "wb");
+  Assert(file != nullptr, "Cannot open the position list dump file.");
+  const auto written = std::fwrite(position_list.data(), sizeof(RowID), position_list.size(), file);
+  Assert(written == position_list.size(), "Could not write the full position list.");
+  std::fclose(file);
+  std::fprintf(stderr, "[W2] dumped %zu RowIDs to %s\n", position_list.size(), path);
+}
+
+}  // namespace
+
 std::shared_ptr<const Table> Sort::_on_execute() {
   auto timer = Timer{};
   const auto& input_table = left_input_table();
@@ -790,6 +813,11 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   }
 
   const auto write_back_time = timer.lap();
+
+  // W2 experiment (HYRISE_SORT_DUMP_LIST): write the final position list to a file, once per process. Excluded from all
+  // steps (the lap below is discarded).
+  dump_position_list_once(position_list);
+  timer.lap();
 
   // TODO(student): Update performance metrics.
   auto& step_performance_data = dynamic_cast<OperatorPerformanceData<OperatorSteps>&>(*performance_data);
