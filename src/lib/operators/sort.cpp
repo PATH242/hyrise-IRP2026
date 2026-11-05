@@ -716,8 +716,9 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto padded_key_size = ((normalized_key_size + 3) / 4) * 4;
 
-  // const auto scan_time = timer.lap();
-  timer.lap();
+  // No lap here: the column scan and the long-string sort are charged to KeyMaterialization (same attribution as the
+  // k-way merge and verge sort branches), since they exist only to size and encode the normalized keys. The timer
+  // keeps running into the materialization below.
 
   // Convert the columnar layout into a row layout for better sorting. This is done by encoding all sorted columns
   // into an array of bytes. These rows can be compared using memcmp.
