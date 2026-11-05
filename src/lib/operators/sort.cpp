@@ -7,6 +7,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <iterator>
@@ -16,10 +17,15 @@
 #include <numeric>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <boost/sort/pdqsort/pdqsort.hpp>
 
@@ -1518,6 +1524,20 @@ std::shared_ptr<AbstractOperator> Sort::_on_deep_copy(
 
 void Sort::_on_set_parameters(const std::unordered_map<ParameterID, AllTypeVariant>& parameters) {}
 
+// W1 experiment: with HYRISE_SORT_FREE_BEFORE_WRITE_OUT set (and not "0"), all sort buffers are released before the
+// output table is written, so that the write-out runs without the sort's live memory. Off by default.
+namespace {
+
+bool free_sort_buffers_before_write_out() {
+  static const auto enabled = []() {
+    const auto* value = std::getenv("HYRISE_SORT_FREE_BEFORE_WRITE_OUT");
+    return value != nullptr && std::string_view{value} != "0";
+  }();
+  return enabled;
+}
+
+}  // namespace
+
 std::shared_ptr<const Table> Sort::_on_execute() {
   auto timer = Timer{};
   const auto& input_table = left_input_table();
@@ -1758,6 +1778,18 @@ std::shared_ptr<const Table> Sort::_on_execute() {
   step_performance_data.set_step_runtime(OperatorSteps::Sort, sort_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergePath, merge_path_time);
   step_performance_data.set_step_runtime(OperatorSteps::MergeTime, merge_time);
+
+  // W1 experiment (see free_sort_buffers_before_write_out): release the sort's buffers before the output is written.
+  // The release is excluded from WRITE_OUT_US (the lap below is discarded); it only shows up in TOTAL_US.
+  if (free_sort_buffers_before_write_out()) {
+    { [[maybe_unused]] auto discarded = std::move(materialized_rows); }
+    { [[maybe_unused]] auto discarded = std::move(sort_scratch); }
+    { [[maybe_unused]] auto discarded = std::move(chunk_allocations); }
+#if defined(__GLIBC__)
+    malloc_trim(0);  // Hand the freed (possibly heap-resident) memory back to the OS.
+#endif
+    timer.lap();
+  }
 
   // We have to materialize the output (i.e., write ValueSegments) if
   //  (a) it is requested by the user,
