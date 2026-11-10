@@ -761,6 +761,17 @@ endif()
 
 target_include_directories(hyrise_impl PUBLIC ${CMAKE_BINARY_DIR})
 
+# Upstream IPS4o (header-only), used by the Sort operator. It relies on 16-byte compare-and-swap (-mcx16, libatomic)
+# and on std::thread for its parallel variant (_REENTRANT is defined via -pthread).
+target_include_directories(hyrise_impl SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ips4o/include)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(hyrise_impl PUBLIC -mcx16)
+endif()
+target_compile_options(hyrise_impl PUBLIC -pthread)
+if(NOT APPLE)
+    target_link_libraries(hyrise_impl PUBLIC atomic)
+endif()
+
 # Precompile the most expensive headers. Only add headers here if you know what you are doing, as this has the potential
 # of negatively affecting the build time.
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")

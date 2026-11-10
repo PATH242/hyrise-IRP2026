@@ -49,8 +49,10 @@
 #include "storage/value_segment.hpp"
 #include "types.hpp"
 #include "utils/assert.hpp"
-#include "utils/ips4o_sort.hpp"
 #include "utils/timer.hpp"
+
+// Upstream IPS4o (https://github.com/ips4o/ips4o), header-only, see third_party/ips4o.
+#include <ips4o.hpp>
 
 namespace {
 
@@ -314,20 +316,23 @@ int static_memcmp(std::byte* left, std::byte* right, size_t len) {
 }
 
 struct NormalizedKeyRow {
-  constexpr NormalizedKeyRow() noexcept = default;
-
   constexpr NormalizedKeyRow(std::byte* key_head, RowID row_id) noexcept : key_head(key_head), row_id(row_id) {}
 
   std::byte* key_head = nullptr;
   RowID row_id;
 
+  // Compares the normalized keys and breaks ties on the RowID. Rows are materialized in input order, so the tie-break
+  // restores the input order for equal keys, which makes an unstable sort algorithm (IPS4o) stable.
   bool less_than(const NormalizedKeyRow& other, size_t expected_size) const {
-    if (expected_size == 0) {
-      return false;
+    if (expected_size > 0) {
+      DebugAssert(key_head, "NormalizedKey is not valid");
+      DebugAssert(other.key_head, "NormalizedKey is not valid");
+      const auto cmp = static_memcmp<1, 32>(key_head, other.key_head, expected_size);
+      if (cmp != 0) {
+        return cmp < 0;
+      }
     }
-    DebugAssert(key_head, "NormalizedKey is not valid");
-    DebugAssert(other.key_head, "NormalizedKey is not valid");
-    return static_memcmp<1, 32>(key_head, other.key_head, expected_size) < 0;
+    return row_id < other.row_id;
   }
 };
 
@@ -796,12 +801,17 @@ std::shared_ptr<const Table> Sort::_on_execute() {
 
   const auto materialization_time = timer.lap();
 
+  // IPS4o is not stable; less_than breaks ties on the RowID, which makes the sort stable (see NormalizedKeyRow).
   const auto comp = [normalized_key_size](const NormalizedKeyRow& lhs, const NormalizedKeyRow& rhs) {
     return lhs.less_than(rhs, normalized_key_size);
   };
-  hyrise::ips4o::sort<NormalizedKeyRow>(std::views::all(materialized_rows), comp, _config.max_parallelism,
-                                        _config.min_blocks_per_stripe, _config.bucket_count - 1,
-                                        _config.samples_per_classifier, _config.block_size);
+
+  // Direct call into the upstream IPS4o library (third_party/ips4o). It spawns its own std::thread pool (or uses OpenMP
+  // if enabled), i.e., it runs outside of Hyrise's scheduler. Only max_parallelism is honored; the remaining Sort::Config
+  // parameters are compile-time constants (ips4o::Config) in upstream IPS4o, for which we keep the library's defaults.
+  // This overload falls back to the sequential IPS4o if fewer than two threads are requested (or the input is small).
+  ::ips4o::parallel::sort(materialized_rows.begin(), materialized_rows.end(), comp,
+                          static_cast<int>(_config.max_parallelism));
 
   const auto sort_time = timer.lap();
 
