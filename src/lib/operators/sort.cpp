@@ -56,7 +56,7 @@
 
 namespace {
 
-using namespace hyrise;  // NOLINT
+using namespace hyrise;
 
 constexpr size_t STRING_CUTOFF = 64;
 
