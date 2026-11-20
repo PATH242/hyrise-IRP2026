@@ -172,6 +172,7 @@ static std::vector<std::string> payload_column_order(const std::string& table_na
 // Configuration parsed from the command line
 // ---------------------------------------------------------------------------------------------------------------
 struct Options {
+  int cores = size_t{0};  // 0 = all available
   std::string routine;
   std::string branch;
   std::string commit;
@@ -191,6 +192,7 @@ static void print_usage() {
             << "  --routine  <tag>                 required; identifies the sort implementation in the CSV\n"
             << "  --sf       <float>               scale factor (default 1)\n"
             << "  --key      <shipdate|ties|pk|comment>  sort key set (default shipdate)\n"
+            << "  --cores    <n>                 number of cores to use (default all available)\n"
             << "  --harness  <operator[,sql]>      which harnesses to run (default operator,sql)\n"
             << "  --payload  <1,4[,8,all]>         payload widths for the operator harness (default 1,4)\n"
             << "  --runs     <n>                   total runs; the first is a discarded warm-up (default 11)\n"
@@ -244,6 +246,8 @@ static Options parse_options(int argc, char* argv[]) {
     } else if (flag == "--help" || flag == "-h") {
       print_usage();
       std::exit(0);
+    } else if (flag == "--cores") {
+      options.cores = std::stoul(next());
     } else {
       std::cerr << "unknown option: " << flag << "\n";
       print_usage();
@@ -420,8 +424,8 @@ static void write_header_if_needed(const std::string& path) {
   }
 
   auto out_file = std::ofstream{path};
-  out_file << "ROUTINE,BRANCH,COMMIT,MACHINE,HARNESS,MATERIALIZED,TABLE,KEY_SET,KEY_COLS,SORT_KEY,SCALE,"
-              "ENCODING,PAYLOAD_COLS,ROW_COUNT,RUN_ID,TOTAL_US";
+  out_file << "ROUTINE,BRANCH,COMMIT,MACHINE,CORES,HARNESS,MATERIALIZED,TABLE,KEY_SET,KEY_COLS,SORT_KEY,SCALE,"
+            "ENCODING,PAYLOAD_COLS,ROW_COUNT,RUN_ID,TOTAL_US";
   for (const auto& phase : PHASES) {
     out_file << ',' << phase.csv_column;
   }
@@ -436,10 +440,12 @@ static void append_samples(const Options& options, const std::vector<std::string
 
   for (auto run_id = size_t{0}; run_id < samples.size(); ++run_id) {
     const auto& sample = samples[run_id];
-    out_file << std::format(R"("{}","{}","{}","{}","{}",{},"{}","{}",{},"{}",{},"{}",{},{},{},{})", options.routine,
-                            options.branch, options.commit, options.machine, harness, materialized ? 1 : 0, TABLE_NAME,
-                            options.key_set, key_columns.size(), key_columns_joined, options.scale_factor,
-                            ENCODING_TAG, payload_columns, row_count, run_id, sample.total_us);
+    out_file << std::format(R"("{}","{}","{}","{}",{},"{}",{},"{}","{}",{},"{}",{},"{}",{},{},{},{})",
+    options.routine, options.branch, options.commit, options.machine,
+    Hyrise::get().topology.num_cpus(),   // actual cores the topology uses
+    harness, materialized ? 1 : 0, TABLE_NAME,
+    options.key_set, key_columns.size(), key_columns_joined, options.scale_factor,
+    ENCODING_TAG, payload_columns, row_count, run_id, sample.total_us);
     for (const auto phase_us : sample.phase_us) {
       out_file << ',' << phase_us;
     }
@@ -460,6 +466,9 @@ int main(int argc, char* argv[]) {
 
   write_header_if_needed(options.out_path);
 
+  if (options.cores > 0) {
+    Hyrise::get().topology.use_default_topology(options.cores);
+  }
   const auto node_queue_scheduler = std::make_shared<NodeQueueScheduler>();
   Hyrise::get().set_scheduler(node_queue_scheduler);
 
