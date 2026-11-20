@@ -172,6 +172,7 @@ static std::vector<std::string> payload_column_order(const std::string& table_na
 // Configuration parsed from the command line
 // ---------------------------------------------------------------------------------------------------------------
 struct Options {
+  int cores = size_t{0};  // 0 = all available
   std::string routine;
   std::string branch;
   std::string commit;
@@ -244,6 +245,8 @@ static Options parse_options(int argc, char* argv[]) {
     } else if (flag == "--help" || flag == "-h") {
       print_usage();
       std::exit(0);
+    } else if (flag == "--cores") {
+      options.cores = std::stoul(next());
     } else {
       std::cerr << "unknown option: " << flag << "\n";
       print_usage();
@@ -460,6 +463,9 @@ int main(int argc, char* argv[]) {
 
   write_header_if_needed(options.out_path);
 
+  if (options.cores > 0) {
+    Hyrise::get().topology.use_default_topology(options.cores);
+  }
   const auto node_queue_scheduler = std::make_shared<NodeQueueScheduler>();
   Hyrise::get().set_scheduler(node_queue_scheduler);
 
