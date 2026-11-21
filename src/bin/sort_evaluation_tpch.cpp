@@ -336,13 +336,17 @@ static std::tuple<std::shared_ptr<GetTable>, std::vector<SortColumnDefinition>, 
 
 static std::vector<RunSample> measure_operator(const std::shared_ptr<AbstractOperator>& input,
                                                const std::vector<SortColumnDefinition>& sort_definitions,
-                                               const size_t run_count) {
+                                               const size_t run_count,
+                                               const Options& options) {
   auto samples = std::vector<RunSample>{};
   samples.reserve(run_count - 1);
-
+  auto config = Sort::Config{};
+  config.max_parallelism = (options.cores > 0) ? options.cores : std::thread::hardware_concurrency();
+  config.bucket_count    = config.max_parallelism * 2;
+  // pass `config` to the Sort constructor
   for (auto run_id = size_t{0}; run_id < run_count; ++run_id) {
     const auto start = std::chrono::steady_clock::now();
-    auto sort = std::make_shared<Sort>(input, sort_definitions, Chunk::DEFAULT_SIZE, Sort::ForceMaterialization::Yes);
+    auto sort = std::make_shared<Sort>(input, sort_definitions, Chunk::DEFAULT_SIZE, Sort::ForceMaterialization::Yes, config);
     sort->execute();
     const auto end = std::chrono::steady_clock::now();
 
@@ -492,7 +496,7 @@ int main(int argc, char* argv[]) {
         const auto payload_width = std::get<2>(setup);
 
         std::cout << std::format("  operator: payload={} ({} columns)\n", width_tag, payload_width) << std::flush;
-        const auto samples = measure_operator(get_table, sort_definitions, options.run_count);
+        const auto samples = measure_operator(get_table, sort_definitions, options.run_count, options);
         // ForceMaterialization::Yes, so the payload is always gathered in this harness.
         append_samples(options, key_set.columns, "operator", /*materialized*/ true, payload_width,
                        get_table->get_output()->row_count(), samples);
